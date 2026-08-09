@@ -9,6 +9,7 @@ import (
 
 	"github.com/sagernet/sing-box/adapter"
 	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/log"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
@@ -39,7 +40,7 @@ func NewOutbound(node sub.Node, dialTimeout time.Duration) (Dialer, error) {
 
 	registry := include.OutboundRegistry()
 	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), registry)
-	out, err := registry.CreateOutbound(ctx, nil, nil, node.Tag, ob.Type, ob.Options)
+	out, err := registry.CreateOutbound(ctx, nil, log.NewNOPFactory().Logger(), node.Tag, ob.Type, ob.Options)
 	if err != nil {
 		return nil, fmt.Errorf("create %s outbound for %s: %w", ob.Type, node.Name, err)
 	}
