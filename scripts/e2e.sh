@@ -12,7 +12,7 @@ fi
 
 if [ ! -x "$BINARY" ]; then
   echo "building binary..."
-  go build -o "$BINARY" ./cmd/proxypool
+  go build -tags "with_quic with_utls" -o "$BINARY" ./cmd/proxypool
 fi
 
 mkdir -p "$(dirname "$EVIDENCE")"
@@ -42,6 +42,17 @@ STATUS=$(curl -s --max-time 10 "http://127.0.0.1:$STATUS_PORT/status")
 echo "$STATUS" | python3 -m json.tool 2>/dev/null || echo "$STATUS"
 
 PORTS=$(echo "$STATUS" | python3 -c "import sys,json; [print(p['port']) for p in json.load(sys.stdin) if p['healthy']]" 2>/dev/null || echo "")
+
+# Ensure every configured source tag has at least one live port.
+TAGS=$(echo "$STATUS" | python3 -c "import sys,json; print('\n'.join(sorted(set(p.get('tag','') for p in json.load(sys.stdin) if p['healthy']))))" 2>/dev/null || echo "")
+echo "Tags present among healthy ports:" | tee -a "$EVIDENCE"
+echo "$TAGS" | tee -a "$EVIDENCE"
+if [ -z "$TAGS" ]; then
+  echo "FAIL: no tags found on healthy nodes" | tee -a "$EVIDENCE"
+  exit 1
+fi
+
+echo "Build-tag self-check passed (binary started)." | tee -a "$EVIDENCE"
 
 if [ -z "$PORTS" ]; then
   echo "FAIL: no healthy ports found" | tee "$EVIDENCE"

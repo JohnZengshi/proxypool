@@ -18,8 +18,8 @@ Go proxy pool service that fetches a Clash subscription, probes each node's real
 
 ```bash
 cp config.example.yaml config.yaml
-# edit config.yaml, set your subscription_url
-go build -o proxypool ./cmd/proxypool
+# edit config.yaml, set your sources (or subscription_url)
+make build
 ./proxypool -config config.yaml
 ```
 
@@ -27,6 +27,7 @@ Output on startup:
 
 ```
 PORT  EXIT_IP           LATENCY(ms)  HEALTHY  NODE
+TAG      NODE
 18081 13.193.127.229    730          yes      日本2
 18082 13.196.174.30     698          yes      日本7
 ...
@@ -60,7 +61,7 @@ curl --proxy http://127.0.0.1:18081 https://api.ipify.org
 
 ## Status API
 
-- `GET /status` - JSON array of all proxy ports with exit IP, latency, health, and node name.
+- `GET /status` - JSON array of all proxy ports with exit IP, latency, health, source tag, and node name.
 - `GET /healthz` - Returns 200 if at least one node is healthy, 503 otherwise.
 - `GET /history` - JSON map of port to latency history samples (last hour, 20s intervals).
 - `POST /probe` - Trigger an on-demand probe. Optional `?port=N` for a single port; omit for all.
@@ -76,7 +77,8 @@ curl -X POST http://127.0.0.1:18080/probe?port=18081
 
 | Field | Default | Description |
 |---|---|---|
-| `subscription_url` | (required) | Clash subscription URL |
+| `sources` | `[]` | List of `{tag,type,url}` sources; type is `clash` or `singbox` |
+| `subscription_url` | _(optional)_ | Legacy single Clash URL; promoted to one `default` source when `sources` is empty |
 | `bind` | `127.0.0.1` | Bind address for proxy ports |
 | `base_port` | `18081` | First port for proxy nodes |
 | `status_port` | `18080` | Port for /status and /healthz |
@@ -96,7 +98,8 @@ CLI flags can override config: `-sub`, `-bind`, `-base-port`.
 
 Open `http://127.0.0.1:18080/` in your browser to see a live table of all proxies with:
 
-- Port, proxy URL, exit IP, node name, health status
+- Port, proxy URL, exit IP, source tag, node name, health status
+- Tag filter (segmented control) to scope the table to one source
 - Current latency with color coding (green < 300ms, yellow < 800ms, red > 800ms)
 - Latency sparkline charts from the last hour of health checks
 - Per-row "probe" button for on-demand latency testing
