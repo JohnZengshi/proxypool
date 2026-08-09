@@ -1,0 +1,51 @@
+{
+  "log": { "level": "info" },
+  "outbounds": [
+    { "type": "selector", "tag": "proxy", "outbounds": ["xboard-aaa", "xboard-bbb", "direct"] },
+    { "type": "direct", "tag": "direct" },
+    { "type": "block", "tag": "block" },
+    { "type": "dns", "tag": "dns-out" },
+    {
+      "type": "hysteria2",
+      "tag": "xboard-aaa",
+      "server": "h2.example.com",
+      "server_port": 443,
+      "password": "redacted-password",
+      "tls": { "enabled": true, "insecure": false, "server_name": "h2.example.com" }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "xboard-aab",
+      "server": "1.2.3.4",
+      "server_port": 8443,
+      "password": "redacted-password",
+      "tls": { "enabled": true, "insecure": true }
+    },
+    {
+      "type": "shadowsocks",
+      "tag": "xboard-bbb",
+      "server": "ss.example.com",
+      "server_port": 8388,
+      "method": "2022-blake3-aes-128-gcm",
+      "password": "redacted-redacted-redacted"
+    },
+    {
+      "type": "anytls",
+      "tag": "xboard-ccc",
+      "server": "anytls.example.com",
+      "server_port": 443,
+      "password": "redacted-password",
+      "tls": { "enabled": true, "server_name": "anytls.example.com" }
+    },
+    {
+      "type": "vmess",
+      "tag": "xboard-ddd",
+      "server": "vmess.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000001",
+      "security": "auto",
+      "alter_id": 0,
+      "tls": { "enabled": true }
+    }
+  ]
+}

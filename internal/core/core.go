@@ -7,9 +7,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/sagernet/sing-vmess"
+	"github.com/sagernet/sing-box/adapter"
+	"github.com/sagernet/sing-box/include"
+	"github.com/sagernet/sing-box/option"
+	"github.com/sagernet/sing/common/json/badoption"
 	M "github.com/sagernet/sing/common/metadata"
-	N "github.com/sagernet/sing/common/network"
+	"github.com/sagernet/sing/service"
 
 	"github.com/john/proxypool/internal/sub"
 )
@@ -19,40 +22,31 @@ type Dialer interface {
 	Close() error
 }
 
-type vmessDialer struct {
-	client   *vmess.Client
-	server   string
-	port     int
-	tls      bool
-	skipCert bool
-	nd       *net.Dialer
+type singDialer struct {
+	outbound adapter.Outbound
 }
 
 func NewOutbound(node sub.Node, dialTimeout time.Duration) (Dialer, error) {
-	security := node.Cipher
-	if security == "" {
-		security = "auto"
+	ob := node.Outbound
+
+	// sing-box's dialer.New resolves domain servers through its own
+	// DNSTransportManager, which we do not run. Resolve up front to an IP and
+	// carry the original domain as TLS SNI so ServerIsDomain() is false.
+	if err := resolveServerIP(context.Background(), &ob, dialTimeout); err != nil {
+		return nil, fmt.Errorf("resolve server for %s: %w", node.Name, err)
 	}
-	if security == "auto" && node.TLS {
-		security = "zero"
-	}
-	client, err := vmess.NewClient(node.UUID, security, node.AlterID)
+	applyDialTimeout(&ob, dialTimeout)
+
+	registry := include.OutboundRegistry()
+	ctx := service.ContextWith[option.OutboundOptionsRegistry](context.Background(), registry)
+	out, err := registry.CreateOutbound(ctx, nil, nil, node.Tag, ob.Type, ob.Options)
 	if err != nil {
-		return nil, fmt.Errorf("vmess client for %s: %w", node.Name, err)
+		return nil, fmt.Errorf("create %s outbound for %s: %w", ob.Type, node.Name, err)
 	}
-	return &vmessDialer{
-		client:   client,
-		server:   node.Server,
-		port:     node.Port,
-		tls:      node.TLS,
-		skipCert: node.SkipCertVerify,
-		nd: &net.Dialer{
-			Timeout: dialTimeout,
-		},
-	}, nil
+	return &singDialer{outbound: out}, nil
 }
 
-func (d *vmessDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+func (d *singDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, portStr, err := net.SplitHostPort(addr)
 	if err != nil {
 		return nil, fmt.Errorf("split addr %s: %w", addr, err)
@@ -62,28 +56,72 @@ func (d *vmessDialer) DialContext(ctx context.Context, network, addr string) (ne
 		return nil, fmt.Errorf("parse port %s: %w", portStr, err)
 	}
 	destination := M.ParseSocksaddrHostPort(host, uint16(port))
-
-	serverAddr := net.JoinHostPort(d.server, strconv.Itoa(d.port))
-	rawConn, err := d.nd.DialContext(ctx, "tcp", serverAddr)
-	if err != nil {
-		return nil, fmt.Errorf("dial server %s: %w", serverAddr, err)
-	}
-
-	var upstream net.Conn = rawConn
-	if d.tls {
-		tlsConn := tlsClient(rawConn, d.server, d.skipCert)
-		if err := tlsConn.HandshakeContext(ctx); err != nil {
-			rawConn.Close()
-			return nil, fmt.Errorf("tls handshake to %s: %w", serverAddr, err)
-		}
-		upstream = tlsConn
-	}
-
-	vconn := d.client.DialEarlyConn(upstream, destination)
-	_ = N.NetworkTCP
-	return vconn, nil
+	return d.outbound.DialContext(ctx, network, destination)
 }
 
-func (d *vmessDialer) Close() error {
+func (d *singDialer) Close() error {
+	if c, ok := d.outbound.(interface{ Close() error }); ok {
+		return c.Close()
+	}
 	return nil
+}
+
+func resolveServerIP(ctx context.Context, ob *option.Outbound, timeout time.Duration) error {
+	sw, ok := ob.Options.(option.ServerOptionsWrapper)
+	if !ok {
+		return nil
+	}
+	so := sw.TakeServerOptions()
+	if so.Server == "" {
+		return fmt.Errorf("empty server")
+	}
+	if net.ParseIP(so.Server) != nil {
+		return nil
+	}
+
+	domain := so.Server
+	rctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIPAddr(rctx, domain)
+	if err != nil {
+		return err
+	}
+	resolved := pickIPv4(ips)
+	if resolved == "" {
+		return fmt.Errorf("no IP for %s", domain)
+	}
+
+	if tw, ok := ob.Options.(option.OutboundTLSOptionsWrapper); ok {
+		tls := tw.TakeOutboundTLSOptions()
+		if tls != nil && tls.Enabled && tls.ServerName == "" {
+			tls.ServerName = domain
+			tw.ReplaceOutboundTLSOptions(tls)
+		}
+	}
+
+	so.Server = resolved
+	sw.ReplaceServerOptions(so)
+	return nil
+}
+
+func pickIPv4(ips []net.IPAddr) string {
+	for _, ip := range ips {
+		if v4 := ip.IP.To4(); v4 != nil {
+			return v4.String()
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0].IP.String()
+	}
+	return ""
+}
+
+func applyDialTimeout(ob *option.Outbound, dialTimeout time.Duration) {
+	dw, ok := ob.Options.(option.DialerOptionsWrapper)
+	if !ok {
+		return
+	}
+	do := dw.TakeDialerOptions()
+	do.ConnectTimeout = badoption.Duration(dialTimeout)
+	dw.ReplaceDialerOptions(do)
 }
