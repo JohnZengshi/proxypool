@@ -9,9 +9,26 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// Source types.
+const (
+	SourceClash   = "clash"
+	SourceSingBox = "singbox"
+)
+
+// Source is one subscription feeding the pool. Every node parsed from a
+// source carries its Tag so the pool can show where a node came from.
+type Source struct {
+	Tag  string `yaml:"tag"`
+	Type string `yaml:"type"`
+	URL  string `yaml:"url"`
+}
+
 // Config holds all runtime configuration.
 type Config struct {
+	// SubscriptionURL is the legacy single-source field. When set and
+	// Sources is empty it is promoted to one clash source tagged "default".
 	SubscriptionURL    string        `yaml:"subscription_url"`
+	Sources            []Source      `yaml:"sources"`
 	Bind               string        `yaml:"bind"`
 	BasePort           int           `yaml:"base_port"`
 	StatusPort         int           `yaml:"status_port"`
@@ -104,19 +121,50 @@ func Load(path string) (*Config, error) {
 		cfg.LogFormat = d.LogFormat
 	}
 
+	cfg.Normalize()
+
 	if err := cfg.Validate(); err != nil {
 		return nil, err
 	}
 	return &cfg, nil
 }
 
+// Normalize promotes the legacy subscription_url into Sources and fills
+// per-source defaults. Safe to call more than once.
+func (c *Config) Normalize() {
+	if len(c.Sources) == 0 && c.SubscriptionURL != "" {
+		c.Sources = []Source{{Tag: "default", Type: SourceClash, URL: c.SubscriptionURL}}
+	}
+	for i := range c.Sources {
+		if c.Sources[i].Type == "" {
+			c.Sources[i].Type = SourceClash
+		}
+	}
+}
+
 // Validate checks required fields and constraints.
 func (c *Config) Validate() error {
-	if c.SubscriptionURL == "" {
-		return fmt.Errorf("subscription_url must not be empty")
+	if len(c.Sources) == 0 {
+		return fmt.Errorf("at least one source is required: set sources or subscription_url")
 	}
-	if !hasScheme(c.SubscriptionURL, "http", "https") {
-		return fmt.Errorf("subscription_url must be http or https")
+	seen := make(map[string]bool, len(c.Sources))
+	for i, s := range c.Sources {
+		if s.Tag == "" {
+			return fmt.Errorf("sources[%d]: tag must not be empty", i)
+		}
+		if seen[s.Tag] {
+			return fmt.Errorf("sources[%d]: duplicate tag %q", i, s.Tag)
+		}
+		seen[s.Tag] = true
+		if s.Type != SourceClash && s.Type != SourceSingBox {
+			return fmt.Errorf("sources[%d] (tag %q): type must be %s or %s, got %q", i, s.Tag, SourceClash, SourceSingBox, s.Type)
+		}
+		if s.URL == "" {
+			return fmt.Errorf("sources[%d] (tag %q): url must not be empty", i, s.Tag)
+		}
+		if !hasScheme(s.URL, "http", "https") {
+			return fmt.Errorf("sources[%d] (tag %q): url must be http or https", i, s.Tag)
+		}
 	}
 	if c.BasePort < 1024 || c.BasePort > 65000 {
 		return fmt.Errorf("base_port must be between 1024 and 65000, got %d", c.BasePort)
