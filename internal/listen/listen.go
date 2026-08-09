@@ -27,6 +27,7 @@ type Server struct {
 	port       int
 	logEnabled bool
 	exitIP     atomic.Pointer[string]
+	tag        atomic.Pointer[string]
 }
 
 func New(addr string, port int, logger *slog.Logger, logEnabled bool) *Server {
@@ -39,6 +40,10 @@ func (s *Server) SetDialer(d core.Dialer) {
 
 func (s *Server) SetExitIP(ip string) {
 	s.exitIP.Store(&ip)
+}
+
+func (s *Server) SetTag(tag string) {
+	s.tag.Store(&tag)
 }
 
 func (s *Server) log() *slog.Logger {
@@ -56,9 +61,14 @@ func (s *Server) reqLog(proto, method, target, status string, durMs, up, down in
 	if p := s.exitIP.Load(); p != nil {
 		ip = *p
 	}
+	tag := ""
+	if t := s.tag.Load(); t != nil {
+		tag = *t
+	}
 	s.log().Info("proxy request",
 		"port", s.port,
 		"exit_ip", ip,
+		"tag", tag,
 		"proto", proto,
 		"method", method,
 		"target", target,
@@ -77,9 +87,14 @@ func (s *Server) warnLog(proto, target, errMsg string) {
 	if p := s.exitIP.Load(); p != nil {
 		ip = *p
 	}
+	tag := ""
+	if t := s.tag.Load(); t != nil {
+		tag = *t
+	}
 	s.log().Warn("proxy error",
 		"port", s.port,
 		"exit_ip", ip,
+		"tag", tag,
 		"proto", proto,
 		"target", target,
 		"err", errMsg,

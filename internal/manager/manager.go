@@ -3,6 +3,7 @@ package manager
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"sort"
@@ -23,6 +24,7 @@ import (
 type NodeStatus struct {
 	Port      int       `json:"port"`
 	ExitIP    string    `json:"exit_ip"`
+	Tag       string    `json:"tag"`
 	NodeName  string    `json:"node_name"`
 	LatencyMS int64     `json:"latency_ms"`
 	Healthy   bool      `json:"healthy"`
@@ -34,6 +36,7 @@ type entry struct {
 	dialer    core.Dialer
 	exitIP    string
 	port      int
+	tag       string
 	server    *listen.Server
 	healthy   bool
 	latency   time.Duration
@@ -81,14 +84,28 @@ type Manager struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 	OnRefresh func()
+	// fetchFunc fetches a source body; tests override it. Defaults to sub.Fetch.
+	fetchFunc func(ctx context.Context, url string) ([]byte, error)
+	// probeNode probes one node, returning exit IP/latency. Defaults to
+	// building a sing-box dialer and probing; tests override it to skip network.
+	probeNode func(ctx context.Context, node sub.Node) (probe.Result, error)
 }
 
 func New(cfg *config.Config, logger *slog.Logger) *Manager {
 	return &Manager{
-		cfg:     cfg,
-		alloc:   alloc.New(cfg.BasePort),
-		entries: make(map[string]*entry),
-		logger:  logger,
+		cfg:       cfg,
+		alloc:     alloc.New(cfg.BasePort),
+		entries:   make(map[string]*entry),
+		logger:    logger,
+		fetchFunc: sub.Fetch,
+		probeNode: func(ctx context.Context, node sub.Node) (probe.Result, error) {
+			d, err := core.NewOutbound(node, cfg.DialTimeout)
+			if err != nil {
+				return probe.Result{}, err
+			}
+			defer d.Close()
+			return probe.Exit(ctx, d, cfg.ProbeURLs, cfg.ProbeTimeout)
+		},
 	}
 }
 
@@ -108,18 +125,42 @@ func (m *Manager) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
+// ingest fetches and parses every configured source, merging nodes into one
+// slice. If a source fails it is logged and skipped; if all sources fail an
+// error is returned. Exit-IP dedupe happens later in refreshOnce.
+func (m *Manager) ingest(ctx context.Context) ([]sub.Node, error) {
+	var all []sub.Node
+	failed := 0
+	for _, src := range m.cfg.Sources {
+		data, err := m.fetchFunc(ctx, src.URL)
+		if err != nil {
+			m.logger.Warn("source fetch failed", "tag", src.Tag, "err", err)
+			failed++
+			continue
+		}
+		result, err := sub.Parse(src, data)
+		if err != nil {
+			m.logger.Warn("source parse failed", "tag", src.Tag, "err", err)
+			failed++
+			continue
+		}
+		if result.Skipped > 0 {
+			m.logger.Info("skipped non-dialable nodes", "tag", src.Tag, "count", result.Skipped, "types", result.SkippedTypes)
+		}
+		all = append(all, result.Nodes...)
+	}
+	if len(m.cfg.Sources) > 0 && failed == len(m.cfg.Sources) {
+		return nil, fmt.Errorf("all %d sources failed", failed)
+	}
+	return all, nil
+}
+
 func (m *Manager) refreshOnce(ctx context.Context) error {
-	data, err := sub.Fetch(ctx, m.cfg.SubscriptionURL)
+	nodes, err := m.ingest(ctx)
 	if err != nil {
 		return err
 	}
-	result, err := sub.Parse(data)
-	if err != nil {
-		return err
-	}
-	if result.Skipped > 0 {
-		m.logger.Info("skipped non-vmess nodes", "count", result.Skipped, "types", result.SkippedTypes)
-	}
+	result := &sub.FetchResult{Nodes: nodes}
 
 	type probeResult struct {
 		node    sub.Node
@@ -139,14 +180,8 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 			sem.Acquire(ctx, 1)
 			defer sem.Release(1)
 
-			d, err := core.NewOutbound(n, m.cfg.DialTimeout)
+			res, err := m.probeNode(ctx, n)
 			if err != nil {
-				m.logger.Warn("create outbound failed", "node", maskUUID(n.Name), "err", err)
-				return
-			}
-			res, err := probe.Exit(ctx, d, m.cfg.ProbeURLs, m.cfg.ProbeTimeout)
-			if err != nil {
-				d.Close()
 				m.logger.Warn("probe failed", "node", maskUUID(n.Name), "err", err)
 				return
 			}
@@ -205,6 +240,7 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 		srv := listen.New(net.JoinHostPort(m.cfg.Bind, itoa(port)), port, m.logger, m.cfg.LogRequests)
 		srv.SetDialer(d)
 		srv.SetExitIP(ip)
+		srv.SetTag(r.node.Tag)
 		go srv.Serve()
 
 		m.entries[key] = &entry{
@@ -212,12 +248,13 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 			dialer:    d,
 			exitIP:    ip,
 			port:      port,
+			tag:       r.node.Tag,
 			server:    srv,
 			healthy:   true,
 			latency:   r.latency,
 			lastCheck: time.Now(),
 		}
-		m.logger.Info("proxy started", "port", port, "exit_ip", ip, "node", maskUUID(r.node.Name), "latency", r.latency)
+		m.logger.Info("proxy started", "port", port, "exit_ip", ip, "tag", r.node.Tag, "node", maskUUID(r.node.Name), "latency", r.latency)
 	}
 
 	for key, e := range m.entries {
@@ -226,7 +263,7 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 			if e.server != nil {
 				e.server.SetDialer(nil)
 			}
-			m.logger.Info("node marked unhealthy", "port", e.port, "exit_ip", e.exitIP, "node", maskUUID(e.node.Name))
+			m.logger.Info("node marked unhealthy", "port", e.port, "exit_ip", e.exitIP, "tag", e.tag, "node", maskUUID(e.node.Name))
 		}
 	}
 
@@ -281,6 +318,9 @@ func (m *Manager) probeEntry(ctx context.Context, e *entry) {
 	}
 	defer e.probing.Store(false)
 
+	if m.probeNode == nil || e.dialer == nil {
+		return
+	}
 	res, err := probe.Exit(ctx, e.dialer, m.cfg.ProbeURLs, m.cfg.ProbeTimeout)
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -307,6 +347,7 @@ func (m *Manager) probeEntry(ctx context.Context, e *entry) {
 			e.server = listen.New(net.JoinHostPort(m.cfg.Bind, itoa(newPort)), newPort, m.logger, m.cfg.LogRequests)
 			e.server.SetDialer(e.dialer)
 			e.server.SetExitIP(res.IP)
+			e.server.SetTag(e.tag)
 			go e.server.Serve()
 		}
 	}
@@ -375,6 +416,7 @@ func (m *Manager) Snapshot() []NodeStatus {
 		statuses = append(statuses, NodeStatus{
 			Port:      e.port,
 			ExitIP:    e.exitIP,
+			Tag:       e.tag,
 			NodeName:  maskUUID(e.node.Name),
 			LatencyMS: e.latency.Milliseconds(),
 			Healthy:   e.healthy,

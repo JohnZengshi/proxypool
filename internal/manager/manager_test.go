@@ -12,6 +12,7 @@ import (
 	"github.com/john/proxypool/internal/config"
 	"github.com/john/proxypool/internal/listen"
 	"github.com/john/proxypool/internal/sub"
+	"github.com/sagernet/sing-box/option"
 )
 
 type fakeDialer struct {
@@ -66,8 +67,6 @@ func TestSnapshotSorted(t *testing.T) {
 func TestDedupeByExitIP(t *testing.T) {
 	n1 := subNode("fast", "srv1", 443)
 	n2 := subNode("slow", "srv2", 443)
-	n1.UUID = "test-uuid"
-	n2.UUID = "test-uuid"
 
 	if n1.Key() == n2.Key() {
 		t.Fatal("different servers should have different keys")
@@ -113,7 +112,22 @@ func allocNew(base int) *alloc.Allocator {
 }
 
 func subNode(name, server string, port int) sub.Node {
-	return sub.Node{Name: name, Server: server, Port: port, Type: "vmess", UUID: "test-uuid", AlterID: 1, Cipher: "auto"}
+	return sub.Node{
+		Tag:    "default",
+		Name:   name,
+		Type:   "vmess",
+		Server: server,
+		Port:   port,
+		Outbound: option.Outbound{
+			Type: "vmess",
+			Tag:  name,
+			Options: &option.VMessOutboundOptions{
+				ServerOptions: option.ServerOptions{Server: server, ServerPort: uint16(port)},
+				UUID:          "test-uuid",
+				Security:      "auto",
+			},
+		},
+	}
 }
 
 func newListen(addr string) *listen.Server {
