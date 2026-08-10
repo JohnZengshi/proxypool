@@ -70,6 +70,8 @@ func Parse(src config.Source, data []byte) (*FetchResult, error) {
 		return parseClash(src.Tag, data)
 	case config.SourceSingBox:
 		return parseSingBox(src.Tag, data)
+	case config.SourceVPNCheap:
+		return parseSingBox(src.Tag, data)
 	default:
 		return nil, fmt.Errorf("unknown source type %q", src.Type)
 	}
