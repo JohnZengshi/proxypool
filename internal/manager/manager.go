@@ -88,6 +88,8 @@ type Manager struct {
 	OnRefresh func()
 	// fetchFunc fetches a source body; tests override it. Defaults to sub.Fetch.
 	fetchFunc func(ctx context.Context, url string) ([]byte, error)
+	// loadFunc loads a configured source body; tests override it. Defaults to sub.Load.
+	loadFunc sub.SourceLoader
 	// probeNode probes one node, returning exit IP/latency. Defaults to
 	// building a sing-box dialer and probing; tests override it to skip network.
 	probeNode func(ctx context.Context, node sub.Node) (probe.Result, error)
@@ -100,6 +102,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Manager {
 		entries:   make(map[string]*entry),
 		logger:    logger,
 		fetchFunc: sub.Fetch,
+		loadFunc:  sub.Load,
 		probeNode: func(ctx context.Context, node sub.Node) (probe.Result, error) {
 			d, err := core.NewOutbound(node, cfg.DialTimeout)
 			if err != nil {
@@ -127,16 +130,18 @@ func (m *Manager) Bootstrap(ctx context.Context) error {
 	return nil
 }
 
-// ingest fetches and parses every configured source, merging nodes into one
-// slice. If a source fails it is logged and skipped; if all sources fail an
-// error is returned. Exit-IP dedupe happens later in refreshOnce.
-func (m *Manager) ingest(ctx context.Context) ([]sub.Node, error) {
+// ingest loads and parses every configured source, merging nodes into one
+// slice. It also returns the set of source tags that refreshed successfully
+// so refreshOnce can retain entries from failed sources. If a source fails it
+// is logged and skipped; if all sources fail an error is returned.
+func (m *Manager) ingest(ctx context.Context) ([]sub.Node, map[string]bool, error) {
 	var all []sub.Node
 	failed := 0
+	successful := make(map[string]bool, len(m.cfg.Sources))
 	for _, src := range m.cfg.Sources {
-		data, err := m.fetchFunc(ctx, src.URL)
+		data, err := m.loadSource(ctx, src)
 		if err != nil {
-			m.logger.Warn("source fetch failed", "tag", src.Tag, "err", err)
+			m.logger.Warn("source load failed", "tag", src.Tag, "err", err)
 			failed++
 			continue
 		}
@@ -146,19 +151,30 @@ func (m *Manager) ingest(ctx context.Context) ([]sub.Node, error) {
 			failed++
 			continue
 		}
+		successful[src.Tag] = true
 		if result.Skipped > 0 {
 			m.logger.Info("skipped non-dialable nodes", "tag", src.Tag, "count", result.Skipped, "types", result.SkippedTypes)
 		}
 		all = append(all, result.Nodes...)
 	}
 	if len(m.cfg.Sources) > 0 && failed == len(m.cfg.Sources) {
-		return nil, fmt.Errorf("all %d sources failed", failed)
+		return nil, nil, fmt.Errorf("all %d sources failed", failed)
 	}
-	return all, nil
+	return all, successful, nil
+}
+
+func (m *Manager) loadSource(ctx context.Context, src config.Source) ([]byte, error) {
+	if m.loadFunc != nil {
+		return m.loadFunc(ctx, src)
+	}
+	if m.fetchFunc != nil && src.Type != config.SourceVPNCheap {
+		return m.fetchFunc(ctx, src.URL)
+	}
+	return sub.Load(ctx, src)
 }
 
 func (m *Manager) refreshOnce(ctx context.Context) error {
-	nodes, err := m.ingest(ctx)
+	nodes, successful, err := m.ingest(ctx)
 	if err != nil {
 		return err
 	}
@@ -261,6 +277,9 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 	}
 
 	for key, e := range m.entries {
+		if !successful[e.tag] {
+			continue
+		}
 		if !activeKeys[key] {
 			e.healthy = false
 			if e.server != nil {

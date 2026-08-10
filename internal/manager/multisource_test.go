@@ -2,8 +2,10 @@ package manager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +37,7 @@ func vmessNode(tag, name, server string, port int) sub.Node {
 func clashSub(proxies ...string) []byte {
 	out := "proxies:\n"
 	for _, p := range proxies {
-		out += fmt.Sprintf("  - {name: %s, server: %s, port: 443, type: vmess, uuid: u, alterId: 1, cipher: auto}\n", p, p)
+		out += fmt.Sprintf("  - {name: %s, server: %s, port: 443, type: vmess, uuid: u, alterId: 1, cipher: auto}\n", p, testServer(p))
 	}
 	return []byte(out)
 }
@@ -46,10 +48,14 @@ func singboxSub(tags ...string) []byte {
 		if i > 0 {
 			out += ","
 		}
-		out += fmt.Sprintf(`{"type":"vmess","tag":"%s","server":"%s","server_port":443,"uuid":"u","security":"auto"}`, tg, tg)
+		out += fmt.Sprintf(`{"type":"vmess","tag":"%s","server":"%s","server_port":443,"uuid":"u","security":"auto"}`, tg, testServer(tg))
 	}
 	out += `]}`
 	return []byte(out)
+}
+
+func testServer(name string) string {
+	return "203.0.113." + strings.TrimPrefix(name, "srv")
 }
 
 func multiSourceConfig() *config.Config {
@@ -68,6 +74,15 @@ func multiSourceConfig() *config.Config {
 			{Tag: "vpncheap", Type: config.SourceSingBox, URL: "http://vpncheap"},
 		},
 	}
+}
+
+func multiSourceCacheConfig() *config.Config {
+	cfg := multiSourceConfig()
+	cfg.Sources = []config.Source{
+		{Tag: "legacy", Type: config.SourceClash, URL: "http://legacy"},
+		{Tag: "vpncheap", Type: config.SourceVPNCheap, Path: `C:\fake\app_state.json`},
+	}
+	return cfg
 }
 
 func newTestManager(t *testing.T, cfg *config.Config) *Manager {
@@ -95,8 +110,8 @@ func TestRefreshMultiSource(t *testing.T) {
 	}
 	// srv1 and srv3 share exit IP 10.0.0.1 to prove global dedupe collapses them.
 	ipByServer := map[string]string{
-		"srv1": "10.0.0.1", "srv2": "10.0.0.2",
-		"srv3": "10.0.0.1", "srv4": "10.0.0.3",
+		testServer("srv1"): "10.0.0.1", testServer("srv2"): "10.0.0.2",
+		testServer("srv3"): "10.0.0.1", testServer("srv4"): "10.0.0.3",
 	}
 	m.probeNode = func(ctx context.Context, node sub.Node) (probe.Result, error) {
 		ip := ipByServer[node.Server]
@@ -161,5 +176,110 @@ func TestRefreshAllSourcesFail(t *testing.T) {
 	}
 	if len(m.Snapshot()) != 0 {
 		t.Fatalf("expected 0 entries, got %d", len(m.Snapshot()))
+	}
+}
+
+func TestRefreshFailedVPNCheapRetainsPriorEntries(t *testing.T) {
+	m := newTestManager(t, multiSourceCacheConfig())
+	failVPNCheap := false
+	m.loadFunc = func(ctx context.Context, src config.Source) ([]byte, error) {
+		switch src.Tag {
+		case "legacy":
+			if failVPNCheap {
+				return clashSub("srv2"), nil
+			}
+			return clashSub("srv1"), nil
+		case "vpncheap":
+			if failVPNCheap {
+				return nil, errors.New("cache down")
+			}
+			return singboxSub("srv3"), nil
+		}
+		return nil, fmt.Errorf("unknown source %s", src.Tag)
+	}
+	m.probeNode = func(ctx context.Context, node sub.Node) (probe.Result, error) {
+		ip := map[string]string{
+			testServer("srv1"): "10.0.0.1",
+			testServer("srv2"): "10.0.0.2",
+			testServer("srv3"): "10.0.0.3",
+		}[node.Server]
+		if ip == "" {
+			return probe.Result{}, fmt.Errorf("no ip for %s", node.Server)
+		}
+		return probe.Result{IP: ip, Latency: 10 * time.Millisecond}, nil
+	}
+
+	if err := m.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	initial := m.Snapshot()
+	var cheapPort int
+	for _, status := range initial {
+		if status.Tag == "vpncheap" {
+			cheapPort = status.Port
+		}
+	}
+	if cheapPort == 0 {
+		t.Fatalf("expected vpncheap entry, got %+v", initial)
+	}
+
+	failVPNCheap = true
+	if err := m.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("refresh with one failed source: %v", err)
+	}
+	snap := m.Snapshot()
+	var cheap *NodeStatus
+	for i := range snap {
+		if snap[i].Tag == "vpncheap" {
+			cheap = &snap[i]
+		}
+	}
+	if cheap == nil {
+		t.Fatalf("expected retained vpncheap entry, got %+v", snap)
+	}
+	if !cheap.Healthy {
+		t.Fatalf("expected vpncheap entry to stay healthy after its source failed, got %+v", cheap)
+	}
+	if cheap.Port != cheapPort {
+		t.Fatalf("expected vpncheap port %d to be retained, got %d", cheapPort, cheap.Port)
+	}
+}
+
+func TestRefreshAllSourcesFailRetainsPriorEntries(t *testing.T) {
+	m := newTestManager(t, multiSourceCacheConfig())
+	m.loadFunc = func(ctx context.Context, src config.Source) ([]byte, error) {
+		switch src.Tag {
+		case "legacy":
+			return clashSub("srv1"), nil
+		case "vpncheap":
+			return singboxSub("srv3"), nil
+		}
+		return nil, fmt.Errorf("unknown source %s", src.Tag)
+	}
+	m.probeNode = func(ctx context.Context, node sub.Node) (probe.Result, error) {
+		ip := map[string]string{testServer("srv1"): "10.0.0.1", testServer("srv3"): "10.0.0.3"}[node.Server]
+		return probe.Result{IP: ip, Latency: 10 * time.Millisecond}, nil
+	}
+	if err := m.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+	if len(m.Snapshot()) != 2 {
+		t.Fatalf("expected 2 initial entries, got %+v", m.Snapshot())
+	}
+
+	m.loadFunc = func(context.Context, config.Source) ([]byte, error) {
+		return nil, errors.New("all down")
+	}
+	if err := m.refreshOnce(context.Background()); err == nil {
+		t.Fatal("expected error when all sources fail")
+	}
+	snap := m.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("expected prior entries to remain after all-source refresh failure, got %+v", snap)
+	}
+	for _, status := range snap {
+		if !status.Healthy {
+			t.Fatalf("expected prior entry %+v to remain healthy after all-source refresh failure", status)
+		}
 	}
 }
