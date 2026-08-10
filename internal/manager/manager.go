@@ -25,6 +25,7 @@ type NodeStatus struct {
 	Port      int       `json:"port"`
 	ExitIP    string    `json:"exit_ip"`
 	Tag       string    `json:"tag"`
+	Type      string    `json:"type"`
 	NodeName  string    `json:"node_name"`
 	LatencyMS int64     `json:"latency_ms"`
 	Healthy   bool      `json:"healthy"`
@@ -37,6 +38,7 @@ type entry struct {
 	exitIP    string
 	port      int
 	tag       string
+	ntype     string
 	server    *listen.Server
 	healthy   bool
 	latency   time.Duration
@@ -249,6 +251,7 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 			exitIP:    ip,
 			port:      port,
 			tag:       r.node.Tag,
+			ntype:     r.node.Type,
 			server:    srv,
 			healthy:   true,
 			latency:   r.latency,
@@ -417,6 +420,7 @@ func (m *Manager) Snapshot() []NodeStatus {
 			Port:      e.port,
 			ExitIP:    e.exitIP,
 			Tag:       e.tag,
+			Type:      e.ntype,
 			NodeName:  maskUUID(e.node.Name),
 			LatencyMS: e.latency.Milliseconds(),
 			Healthy:   e.healthy,

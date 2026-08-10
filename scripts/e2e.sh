@@ -16,6 +16,7 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 mkdir -p "$(dirname "$EVIDENCE")"
+POOL_LOG="${EVIDENCE}.pool.log"
 
 cleanup() {
   if [ -n "${PID:-}" ] && kill -0 "$PID" 2>/dev/null; then
@@ -26,7 +27,7 @@ cleanup() {
 trap cleanup EXIT
 
 echo "starting proxypool with config $CONFIG..."
-"$BINARY" -config "$CONFIG" 2>&1 &
+"$BINARY" -config "$CONFIG" > "$POOL_LOG" 2>&1 &
 PID=$!
 
 echo "waiting for startup..."
@@ -49,6 +50,16 @@ echo "Tags present among healthy ports:" | tee -a "$EVIDENCE"
 echo "$TAGS" | tee -a "$EVIDENCE"
 if [ -z "$TAGS" ]; then
   echo "FAIL: no tags found on healthy nodes" | tee -a "$EVIDENCE"
+  exit 1
+fi
+
+HY2=$(echo "$STATUS" | python3 -c "import sys,json; print('\n'.join(p['node_name'] for p in json.load(sys.stdin) if p['healthy'] and p.get('type')=='hysteria2'))" 2>/dev/null || echo "")
+echo "Hysteria2 nodes live:" | tee -a "$EVIDENCE"
+if [ -n "$HY2" ]; then
+  echo "$HY2" | head -5 | tee -a "$EVIDENCE"
+else
+  echo "  none" | tee -a "$EVIDENCE"
+  echo "FAIL: no healthy hysteria2-backed node (with_quic not effective)" | tee -a "$EVIDENCE"
   exit 1
 fi
 
@@ -137,13 +148,7 @@ else
 fi
 
 echo "Checking startup URL block..." | tee -a "$EVIDENCE"
-STARTUP_LOG="$EVIDENCE.startup.log"
-"$BINARY" -config "$CONFIG" > "$STARTUP_LOG" 2>&1 &
-STARTUP_PID=$!
-sleep 8
-kill -INT "$STARTUP_PID" 2>/dev/null || true
-wait "$STARTUP_PID" 2>/dev/null || true
-URL_COUNT=$(grep -c "^http://127.0.0.1:" "$STARTUP_LOG" 2>/dev/null || echo "0")
+URL_COUNT=$(grep -c "^http://127.0.0.1:" "$POOL_LOG" 2>/dev/null || echo "0")
 if [ "$URL_COUNT" -gt 0 ]; then
   echo "  startup URL block: OK ($URL_COUNT URLs)" | tee -a "$EVIDENCE"
 else
