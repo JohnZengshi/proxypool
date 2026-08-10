@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
+	"runtime"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -11,8 +13,9 @@ import (
 
 // Source types.
 const (
-	SourceClash   = "clash"
-	SourceSingBox = "singbox"
+	SourceClash    = "clash"
+	SourceSingBox  = "singbox"
+	SourceVPNCheap = "vpncheap"
 )
 
 // Source is one subscription feeding the pool. Every node parsed from a
@@ -21,6 +24,7 @@ type Source struct {
 	Tag  string `yaml:"tag"`
 	Type string `yaml:"type"`
 	URL  string `yaml:"url"`
+	Path string `yaml:"path"`
 }
 
 // Config holds all runtime configuration.
@@ -132,6 +136,10 @@ func Load(path string) (*Config, error) {
 // Normalize promotes the legacy subscription_url into Sources and fills
 // per-source defaults. Safe to call more than once.
 func (c *Config) Normalize() {
+	c.normalizeOn(runtime.GOOS)
+}
+
+func (c *Config) normalizeOn(goos string) {
 	if len(c.Sources) == 0 && c.SubscriptionURL != "" {
 		c.Sources = []Source{{Tag: "default", Type: SourceClash, URL: c.SubscriptionURL}}
 	}
@@ -139,11 +147,20 @@ func (c *Config) Normalize() {
 		if c.Sources[i].Type == "" {
 			c.Sources[i].Type = SourceClash
 		}
+		if c.Sources[i].Type == SourceVPNCheap && goos == "windows" && c.Sources[i].Path == "" {
+			if appData := os.Getenv("APPDATA"); appData != "" {
+				c.Sources[i].Path = filepath.Join(appData, "vpncheap", "app_state.json")
+			}
+		}
 	}
 }
 
 // Validate checks required fields and constraints.
 func (c *Config) Validate() error {
+	return c.validateOn(runtime.GOOS)
+}
+
+func (c *Config) validateOn(goos string) error {
 	if len(c.Sources) == 0 {
 		return fmt.Errorf("at least one source is required: set sources or subscription_url")
 	}
@@ -156,14 +173,31 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("sources[%d]: duplicate tag %q", i, s.Tag)
 		}
 		seen[s.Tag] = true
-		if s.Type != SourceClash && s.Type != SourceSingBox {
-			return fmt.Errorf("sources[%d] (tag %q): type must be %s or %s, got %q", i, s.Tag, SourceClash, SourceSingBox, s.Type)
+		if s.Type != SourceClash && s.Type != SourceSingBox && s.Type != SourceVPNCheap {
+			return fmt.Errorf("sources[%d] (tag %q): type must be %s, %s, or %s, got %q", i, s.Tag, SourceClash, SourceSingBox, SourceVPNCheap, s.Type)
 		}
-		if s.URL == "" {
-			return fmt.Errorf("sources[%d] (tag %q): url must not be empty", i, s.Tag)
-		}
-		if !hasScheme(s.URL, "http", "https") {
-			return fmt.Errorf("sources[%d] (tag %q): url must be http or https", i, s.Tag)
+		switch {
+		case s.Type == SourceVPNCheap && goos == "windows":
+			if s.Path == "" {
+				return fmt.Errorf("sources[%d] (tag %q): path must not be empty for vpncheap on windows", i, s.Tag)
+			}
+			if hasScheme(s.Path, "http", "https") {
+				return fmt.Errorf("sources[%d] (tag %q): path must be a filesystem path, not a URL", i, s.Tag)
+			}
+		case s.Type == SourceVPNCheap && goos == "darwin":
+			if s.URL == "" {
+				return fmt.Errorf("sources[%d] (tag %q): url must not be empty for vpncheap on darwin", i, s.Tag)
+			}
+			if !hasScheme(s.URL, "http", "https") {
+				return fmt.Errorf("sources[%d] (tag %q): url must be http or https", i, s.Tag)
+			}
+		case s.Type != SourceVPNCheap:
+			if s.URL == "" {
+				return fmt.Errorf("sources[%d] (tag %q): url must not be empty", i, s.Tag)
+			}
+			if !hasScheme(s.URL, "http", "https") {
+				return fmt.Errorf("sources[%d] (tag %q): url must be http or https", i, s.Tag)
+			}
 		}
 	}
 	if c.BasePort < 1024 || c.BasePort > 65000 {

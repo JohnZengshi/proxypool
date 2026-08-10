@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -236,5 +237,119 @@ func TestSourcesInvalid(t *testing.T) {
 				t.Fatalf("error %q should contain %q", err.Error(), tt.want)
 			}
 		})
+	}
+}
+
+func TestLoadVPNCheapWindowsDefaultPath(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("windows-only config path behavior")
+	}
+	dir := t.TempDir()
+	t.Setenv("APPDATA", dir)
+	p := filepath.Join(dir, "config.yaml")
+	os.WriteFile(p, []byte(`sources:
+  - tag: vpncheap
+    type: vpncheap
+`), 0644)
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(dir, "vpncheap", "app_state.json")
+	if cfg.Sources[0].Path != want {
+		t.Fatalf("expected Windows default path %q, got %q", want, cfg.Sources[0].Path)
+	}
+	if cfg.Sources[0].URL != "" {
+		t.Fatalf("expected optional URL to stay empty, got %q", cfg.Sources[0].URL)
+	}
+}
+
+func TestSourcesVPNCheapPlatformValidation(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("APPDATA", dir)
+	tests := []struct {
+		name   string
+		goos   string
+		source Source
+		want   string
+	}{
+		{
+			name: "windows_default_path_optional_url",
+			goos: "windows",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+			},
+		},
+		{
+			name: "macos_url_required",
+			goos: "darwin",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+			},
+			want: "url must not be empty for vpncheap on darwin",
+		},
+		{
+			name: "macos_bad_url_scheme",
+			goos: "darwin",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+				URL:  "ftp://example.com/sub",
+			},
+			want: "url must be http or https",
+		},
+		{
+			name: "windows_path_url",
+			goos: "windows",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+				Path: "https://example.com/app_state.json",
+			},
+			want: "path must be a filesystem path",
+		},
+		{
+			name: "linux_accepts_config",
+			goos: "linux",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := defaults()
+			cfg.Sources = []Source{tt.source}
+			cfg.normalizeOn(tt.goos)
+			err := cfg.validateOn(tt.goos)
+			if tt.want == "" {
+				if err != nil {
+					t.Fatalf("expected valid source, got %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tt.want)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error %q should contain %q", err.Error(), tt.want)
+			}
+		})
+	}
+}
+
+func TestLoadConfigExamplePortable(t *testing.T) {
+	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, goos := range []string{"windows", "darwin", "linux"} {
+		if err := cfg.validateOn(goos); err != nil {
+			t.Fatalf("config example failed validation on %s: %v", goos, err)
+		}
 	}
 }
