@@ -1,6 +1,6 @@
 # proxypool
 
-Go proxy pool service that fetches a Clash subscription, probes each node's real exit IP, dedupes by exit IP, and exposes one no-auth HTTP+SOCKS5 port per surviving node.
+Go proxy pool service that loads Clash, sing-box, or Windows VPNCheap cache sources, probes each node's real exit IP, dedupes by exit IP, and exposes one no-auth HTTP+SOCKS5 port per surviving node.
 
 ## What it does
 
@@ -77,8 +77,9 @@ curl -X POST http://127.0.0.1:18080/probe?port=18081
 
 | Field | Default | Description |
 |---|---|---|
-| `sources` | `[]` | List of `{tag,type,url}` sources; type is `clash` or `singbox` |
+| `sources` | `[]` | List of `{tag,type,url[,path]}` sources; type is `clash`, `singbox`, or `vpncheap` |
 | `subscription_url` | _(optional)_ | Legacy single Clash URL; promoted to one `default` source when `sources` is empty |
+| `path` | _(vpncheap only)_ | Windows cache file; defaults to `%APPDATA%\vpncheap\app_state.json` |
 | `bind` | `127.0.0.1` | Bind address for proxy ports |
 | `base_port` | `18081` | First port for proxy nodes |
 | `status_port` | `18080` | Port for /status and /healthz |
@@ -93,6 +94,10 @@ curl -X POST http://127.0.0.1:18080/probe?port=18081
 | `log_format` | `text` | Log format: `text` or `json` |
 
 CLI flags can override config: `-sub`, `-bind`, `-base-port`.
+
+## VPNCheap source
+
+On Windows, `type: vpncheap` reads and decrypts the current user's VPNCheap local cache, so VPNCheap does not need to be running. Set `path` to override the default cache file. On macOS, `url` is required and is fetched as a sing-box subscription, preserving the previous behavior. Linux accepts the config but reports `vpncheap` as unsupported at source load.
 
 ## Monitoring dashboard
 

@@ -14,7 +14,8 @@ log_requests: true
 log_format: text
 
 # Tagged subscription sources. Each node is labeled with its source tag.
-# type is "clash" (clash-vmess) or "singbox" (sing-box JSON config).
+# type is "clash" (clash-vmess), "singbox" (sing-box JSON config), or
+# "vpncheap" (Windows local cache; macOS URL fallback).
 # The legacy single "subscription_url" field still works: when "sources" is
 # empty it is promoted to one source tagged "default" of type "clash".
 sources:
@@ -22,5 +23,10 @@ sources:
     type: clash
     url: "https://example.com/your-subscription.yaml"
   - tag: vpncheap
-    type: singbox
+    type: vpncheap
+    # Windows reads the current user's local VPNCheap cache. VPNCheap does not
+    # need to be running. Override the default %APPDATA%\vpncheap\app_state.json
+    # with "path".
+    # path: "C:\\Users\\me\\AppData\\Roaming\\vpncheap\\app_state.json"
+    # macOS requires and fetches this URL as a sing-box subscription.
     url: "https://example.com/cheap/your-token?flag=sing-box"
