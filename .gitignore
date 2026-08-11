@@ -4,3 +4,6 @@ config.yaml
 /proxypool.exe
 .omo/
 .codegraph/
+.codex/
+
+*.log
