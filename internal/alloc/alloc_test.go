@@ -1,6 +1,7 @@
 package alloc
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -63,6 +64,30 @@ func TestSaveLoadPersistence(t *testing.T) {
 	}
 }
 
+func TestNodeKeyPersistenceAndLegacyMigration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.json")
+	a1 := New(18081)
+	if p, err := a1.PortFor("default|srv1:443", "1.2.3.4"); err != nil || p != 18081 {
+		t.Fatalf("PortFor = %d, %v; want 18081, nil", p, err)
+	}
+	if _, ok := a1.m["1.2.3.4"]; ok {
+		t.Fatal("legacy IP mapping was not migrated")
+	}
+	if err := a1.Save(path); err != nil {
+		t.Fatal(err)
+	}
+
+	a2 := New(18081)
+	if err := a2.Load(path); err != nil {
+		t.Fatal(err)
+	}
+	p, err := a2.PortFor("default|srv1:443", "5.6.7.8")
+	if err != nil || p != 18081 {
+		t.Fatalf("node key port after reload = %d, %v; want 18081, nil", p, err)
+	}
+}
+
 func TestLoadMissingFile(t *testing.T) {
 	a := New(18081)
 	err := a.Load("/nonexistent/state.json")
@@ -78,7 +103,11 @@ func TestLoadMissingFile(t *testing.T) {
 func TestSaveUnwritable(t *testing.T) {
 	a := New(18081)
 	a.Port("1.1.1.1")
-	err := a.Save("/nonexistent/dir/sub/state.json")
+	blocker := filepath.Join(t.TempDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	err := a.Save(filepath.Join(blocker, "state.json"))
 	if err == nil {
 		t.Fatal("expected error for unwritable path")
 	}

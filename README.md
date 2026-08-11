@@ -82,7 +82,7 @@ curl -X POST http://127.0.0.1:18080/probe?port=18081
 | `path` | _(vpncheap only)_ | Windows cache file; defaults to `%APPDATA%\vpncheap\app_state.json` |
 | `bind` | `127.0.0.1` | Bind address for proxy ports |
 | `base_port` | `18081` | First port for proxy nodes |
-| `status_port` | `18080` | Port for /status and /healthz |
+| `status_port` | `18080` | Port for the monitoring dashboard and status API |
 | `state_file` | `./state.json` | Port-to-IP mapping persistence |
 | `probe_urls` | `[api.ipify.org, ifconfig.me/ip]` | IP echo services for exit probing |
 | `probe_timeout` | `10s` | Timeout per probe attempt |

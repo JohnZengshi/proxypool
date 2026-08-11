@@ -24,20 +24,63 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.BasePort != 18081 {
 		t.Fatalf("expected BasePort=18081, got %d", cfg.BasePort)
 	}
-	if cfg.ProbeTimeout != 10*time.Second {
-		t.Fatalf("expected ProbeTimeout=10s, got %v", cfg.ProbeTimeout)
+	if cfg.ProbeTimeout != 6*time.Second {
+		t.Fatalf("expected ProbeTimeout=6s, got %v", cfg.ProbeTimeout)
 	}
-	if cfg.MaxConcurrentProbe != 8 {
-		t.Fatalf("expected MaxConcurrentProbe=8, got %d", cfg.MaxConcurrentProbe)
+	if cfg.MaxConcurrentProbe != 12 {
+		t.Fatalf("expected MaxConcurrentProbe=12, got %d", cfg.MaxConcurrentProbe)
 	}
-	if cfg.HealthInterval != 20*time.Second {
-		t.Fatalf("expected HealthInterval=20s, got %v", cfg.HealthInterval)
+	if cfg.HealthInterval != 60*time.Second {
+		t.Fatalf("expected HealthInterval=60s, got %v", cfg.HealthInterval)
+	}
+	if cfg.TrafficProbeURL != "https://www.cloudflare.com/cdn-cgi/trace" {
+		t.Fatalf("unexpected TrafficProbeURL %q", cfg.TrafficProbeURL)
+	}
+	targets := cfg.TrafficProbeTargets()
+	if len(targets) != 2 || targets[0] != "https://www.cloudflare.com/cdn-cgi/trace" || targets[1] != "https://api.ipify.org" {
+		t.Fatalf("unexpected default traffic probe targets %v", targets)
+	}
+	if cfg.TrafficProbeTimeout != 6*time.Second {
+		t.Fatalf("expected TrafficProbeTimeout=6s, got %v", cfg.TrafficProbeTimeout)
+	}
+	if cfg.SlowLatency != 2*time.Second {
+		t.Fatalf("expected SlowLatency=2s, got %v", cfg.SlowLatency)
 	}
 	if !cfg.LogRequests {
 		t.Fatal("expected LogRequests=true by default")
 	}
 	if cfg.LogFormat != "text" {
 		t.Fatalf("expected LogFormat=text, got %s", cfg.LogFormat)
+	}
+}
+
+func TestLoadLegacyTrafficProbeOnly(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	os.WriteFile(p, []byte("subscription_url: https://example.com/sub.yaml\ntraffic_probe_url: https://legacy.example.com/check\n"), 0644)
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := cfg.TrafficProbeTargets()
+	if len(targets) != 1 || targets[0] != "https://legacy.example.com/check" {
+		t.Fatalf("expected legacy target to win, got %v", targets)
+	}
+}
+
+func TestLoadTrafficProbeURLsWins(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.yaml")
+	os.WriteFile(p, []byte("subscription_url: https://example.com/sub.yaml\ntraffic_probe_urls:\n  - https://first.example.com/check\n  - https://second.example.com/check\n"), 0644)
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	targets := cfg.TrafficProbeTargets()
+	if len(targets) != 2 || targets[0] != "https://first.example.com/check" || targets[1] != "https://second.example.com/check" {
+		t.Fatalf("unexpected traffic probe targets %v", targets)
 	}
 }
 
@@ -93,6 +136,10 @@ func TestLoadValidationErrors(t *testing.T) {
 		{"bad_port", "subscription_url: https://x.com\nbind: 127.0.0.1\nbase_port: 80\n"},
 		{"bad_bind", "subscription_url: https://x.com\nbind: not-an-ip\nbase_port: 18081\n"},
 		{"bad_scheme", "subscription_url: ftp://x.com\nbind: 127.0.0.1\nbase_port: 18081\n"},
+		{"bad_traffic_probe", "subscription_url: https://x.com\nbind: 127.0.0.1\nbase_port: 18081\ntraffic_probe_url: ftp://x.com\n"},
+		{"bad_traffic_probe_urls", "subscription_url: https://x.com\nbind: 127.0.0.1\nbase_port: 18081\ntraffic_probe_urls:\n  - ftp://x.com\n"},
+		{"empty_traffic_probe_urls", "subscription_url: https://x.com\nbind: 127.0.0.1\nbase_port: 18081\ntraffic_probe_urls:\n  - \"\"\n"},
+		{"bad_traffic_timeout", "subscription_url: https://x.com\nbind: 127.0.0.1\nbase_port: 18081\ntraffic_probe_timeout: 0s\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -31,22 +32,29 @@ type Source struct {
 type Config struct {
 	// SubscriptionURL is the legacy single-source field. When set and
 	// Sources is empty it is promoted to one clash source tagged "default".
-	SubscriptionURL    string        `yaml:"subscription_url"`
-	Sources            []Source      `yaml:"sources"`
-	Bind               string        `yaml:"bind"`
-	BasePort           int           `yaml:"base_port"`
-	StatusPort         int           `yaml:"status_port"`
-	StateFile          string        `yaml:"state_file"`
-	ProbeURLs          []string      `yaml:"probe_urls"`
-	ProbeTimeout       time.Duration `yaml:"probe_timeout"`
-	HealthInterval     time.Duration `yaml:"health_interval"`
-	RefreshInterval    time.Duration `yaml:"refresh_interval"`
-	DialTimeout        time.Duration `yaml:"dial_timeout"`
-	MaxConcurrentProbe int           `yaml:"max_concurrent_probe"`
-	LogRequests        bool          `yaml:"log_requests"`
-	LogFormat          string        `yaml:"log_format"`
+	SubscriptionURL     string        `yaml:"subscription_url"`
+	Sources             []Source      `yaml:"sources"`
+	Bind                string        `yaml:"bind"`
+	BasePort            int           `yaml:"base_port"`
+	StatusPort          int           `yaml:"status_port"`
+	StateFile           string        `yaml:"state_file"`
+	ProbeURLs           []string      `yaml:"probe_urls"`
+	ProbeTimeout        time.Duration `yaml:"probe_timeout"`
+	HealthInterval      time.Duration `yaml:"health_interval"`
+	RefreshInterval     time.Duration `yaml:"refresh_interval"`
+	DialTimeout         time.Duration `yaml:"dial_timeout"`
+	MaxConcurrentProbe  int           `yaml:"max_concurrent_probe"`
+	TrafficProbeURLs    []string      `yaml:"traffic_probe_urls"`
+	TrafficProbeURL     string        `yaml:"traffic_probe_url"`
+	TrafficProbeTimeout time.Duration `yaml:"traffic_probe_timeout"`
+	SlowLatency         time.Duration `yaml:"slow_latency"`
+	LogRequests         bool          `yaml:"log_requests"`
+	LogFormat           string        `yaml:"log_format"`
 
-	logRequestsSet bool `yaml:"-"`
+	logRequestsSet    bool `yaml:"-"`
+	probeTimeoutSet   bool `yaml:"-"`
+	trafficTimeoutSet bool `yaml:"-"`
+	slowLatencySet    bool `yaml:"-"`
 }
 
 func defaults() Config {
@@ -56,13 +64,20 @@ func defaults() Config {
 		StatusPort:         18080,
 		StateFile:          "./state.json",
 		ProbeURLs:          []string{"https://api.ipify.org", "https://ifconfig.me/ip"},
-		ProbeTimeout:       10 * time.Second,
-		HealthInterval:     20 * time.Second,
+		ProbeTimeout:       6 * time.Second,
+		HealthInterval:     60 * time.Second,
 		RefreshInterval:    6 * time.Hour,
 		DialTimeout:        10 * time.Second,
-		MaxConcurrentProbe: 8,
-		LogRequests:        true,
-		LogFormat:          "text",
+		MaxConcurrentProbe: 12,
+		TrafficProbeURLs: []string{
+			"https://www.cloudflare.com/cdn-cgi/trace",
+			"https://api.ipify.org",
+		},
+		TrafficProbeURL:     "https://www.cloudflare.com/cdn-cgi/trace",
+		TrafficProbeTimeout: 6 * time.Second,
+		SlowLatency:         2 * time.Second,
+		LogRequests:         true,
+		LogFormat:           "text",
 	}
 }
 
@@ -81,6 +96,27 @@ func Load(path string) (*Config, error) {
 		}
 		if _, ok := probe["log_requests"]; ok {
 			cfg.logRequestsSet = true
+		}
+		if _, ok := probe["probe_timeout"]; ok {
+			cfg.probeTimeoutSet = true
+		}
+		if _, ok := probe["traffic_probe_timeout"]; ok {
+			cfg.trafficTimeoutSet = true
+		}
+		if _, ok := probe["traffic_probe_urls"]; !ok {
+			if _, hasLegacy := probe["traffic_probe_url"]; hasLegacy {
+				cfg.TrafficProbeURLs = nil
+			}
+		}
+		if _, ok := probe["slow_latency"]; ok {
+			cfg.slowLatencySet = true
+		}
+		for _, key := range []string{"probe_timeout", "traffic_probe_timeout", "slow_latency"} {
+			if value, ok := probe[key]; ok {
+				if duration, err := time.ParseDuration(strings.TrimSpace(fmt.Sprint(value))); err == nil && duration <= 0 {
+					return nil, fmt.Errorf("%s must be greater than zero", key)
+				}
+			}
 		}
 		if err := yaml.Unmarshal(raw, &cfg); err != nil {
 			return nil, fmt.Errorf("parse config %s: %w", path, err)
@@ -118,6 +154,18 @@ func Load(path string) (*Config, error) {
 	if cfg.MaxConcurrentProbe == 0 {
 		cfg.MaxConcurrentProbe = d.MaxConcurrentProbe
 	}
+	if cfg.TrafficProbeURL == "" {
+		cfg.TrafficProbeURL = d.TrafficProbeURL
+	}
+	if len(cfg.TrafficProbeURLs) == 0 && cfg.TrafficProbeURL != "" {
+		cfg.TrafficProbeURLs = []string{cfg.TrafficProbeURL}
+	}
+	if cfg.TrafficProbeTimeout == 0 {
+		cfg.TrafficProbeTimeout = d.TrafficProbeTimeout
+	}
+	if cfg.SlowLatency == 0 {
+		cfg.SlowLatency = d.SlowLatency
+	}
 	if !cfg.logRequestsSet {
 		cfg.LogRequests = d.LogRequests
 	}
@@ -131,6 +179,18 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+// TrafficProbeTargets returns the ordered traffic probe URLs. The list field
+// wins when configured; otherwise the legacy single URL is used.
+func (c *Config) TrafficProbeTargets() []string {
+	if len(c.TrafficProbeURLs) > 0 {
+		return c.TrafficProbeURLs
+	}
+	if c.TrafficProbeURL != "" {
+		return []string{c.TrafficProbeURL}
+	}
+	return nil
 }
 
 // Normalize promotes the legacy subscription_url into Sources and fills
@@ -208,6 +268,22 @@ func (c *Config) validateOn(goos string) error {
 	}
 	if c.LogFormat != "text" && c.LogFormat != "json" {
 		return fmt.Errorf("log_format must be text or json, got %q", c.LogFormat)
+	}
+	if !hasScheme(c.TrafficProbeURL, "http", "https") {
+		return fmt.Errorf("traffic_probe_url must be http or https, got %q", c.TrafficProbeURL)
+	}
+	for i, u := range c.TrafficProbeTargets() {
+		if u == "" {
+			return fmt.Errorf("traffic_probe_urls[%d] must not be empty", i)
+		}
+		if !hasScheme(u, "http", "https") {
+			return fmt.Errorf("traffic_probe_urls[%d] must be http or https, got %q", i, u)
+		}
+	}
+	if (c.probeTimeoutSet && c.ProbeTimeout <= 0) ||
+		(c.trafficTimeoutSet && c.TrafficProbeTimeout <= 0) ||
+		(c.slowLatencySet && c.SlowLatency <= 0) {
+		return fmt.Errorf("probe_timeout, traffic_probe_timeout, and slow_latency must be greater than zero")
 	}
 	return nil
 }

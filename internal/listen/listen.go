@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,23 +20,56 @@ import (
 
 type Server struct {
 	addr   string
-	dialer atomic.Pointer[core.Dialer]
+	dialer atomic.Pointer[dialerSlot]
 	ln     atomic.Pointer[net.Listener]
 	wg     sync.WaitGroup
 
-	logger     *slog.Logger
-	port       int
-	logEnabled bool
-	exitIP     atomic.Pointer[string]
-	tag        atomic.Pointer[string]
+	logger      *slog.Logger
+	port        int
+	logEnabled  bool
+	exitIP      atomic.Pointer[string]
+	tag         atomic.Pointer[string]
+	dialTimeout time.Duration
 }
 
-func New(addr string, port int, logger *slog.Logger, logEnabled bool) *Server {
-	return &Server{addr: addr, port: port, logger: logger, logEnabled: logEnabled}
+type dialerSlot struct {
+	d core.Dialer
+}
+
+func New(addr string, port int, logger *slog.Logger, logEnabled bool, dialTimeout time.Duration) *Server {
+	return &Server{addr: addr, port: port, logger: logger, logEnabled: logEnabled, dialTimeout: dialTimeout}
 }
 
 func (s *Server) SetDialer(d core.Dialer) {
-	s.dialer.Store(&d)
+	if d != nil {
+		s.dialer.Store(&dialerSlot{d: d})
+		return
+	}
+	s.dialer.Store(nil)
+}
+
+func (s *Server) Addr() string {
+	if p := s.ln.Load(); p != nil {
+		return (*p).Addr().String()
+	}
+	return ""
+}
+
+func (s *Server) loadDialer() core.Dialer {
+	if slot := s.dialer.Load(); slot != nil {
+		return slot.d
+	}
+	return nil
+}
+
+func (s *Server) dial(network, addr string) (net.Conn, error) {
+	d := s.loadDialer()
+	if d == nil {
+		return nil, fmt.Errorf("no dialer")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.dialTimeout)
+	defer cancel()
+	return d.DialContext(ctx, network, addr)
 }
 
 func (s *Server) SetExitIP(ip string) {
@@ -154,8 +188,7 @@ func (s *Server) handle(conn net.Conn) {
 	}
 	br.UnreadByte()
 
-	dp := s.dialer.Load()
-	if dp == nil {
+	if s.loadDialer() == nil {
 		if firstByte == 0x05 {
 			conn.Write([]byte{0x05, 0x01})
 		} else {
@@ -234,21 +267,18 @@ func (s *Server) handleSocks5(conn net.Conn, br *bufio.Reader) {
 	port := binary.BigEndian.Uint16(portBuf)
 	dest := net.JoinHostPort(host, strconv.Itoa(int(port)))
 
-	dp := s.dialer.Load()
-	if dp == nil {
+	if s.loadDialer() == nil {
 		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		s.warnLog("socks5", dest, "no dialer")
 		return
 	}
-
-	remote, err := (*dp).DialContext(context.Background(), "tcp", dest)
+	remote, err := s.dial("tcp", dest)
 	if err != nil {
 		conn.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		s.warnLog("socks5", dest, err.Error())
 		return
 	}
 	defer remote.Close()
-
 	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	up, down := relay(conn, remote)
 	s.reqLog("socks5", "CONNECT", dest, "ok", time.Since(start).Milliseconds(), up, down)
@@ -256,39 +286,37 @@ func (s *Server) handleSocks5(conn net.Conn, br *bufio.Reader) {
 
 func (s *Server) handleHTTP(conn net.Conn, br *bufio.Reader) {
 	start := time.Now()
-	line, err := br.ReadString('\n')
+	req, err := http.ReadRequest(br)
 	if err != nil {
-		return
-	}
-	line = strings.TrimSpace(line)
-	parts := strings.SplitN(line, " ", 3)
-	if len(parts) < 3 {
 		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-		s.warnLog("http", "", "malformed request line")
+		s.warnLog("http", "", "malformed request")
 		return
 	}
-	method := parts[0]
-	target := parts[1]
-
-	for {
-		hdrLine, err := br.ReadString('\n')
-		if err != nil {
-			return
-		}
-		if strings.TrimSpace(hdrLine) == "" {
-			break
-		}
-	}
-
-	dp := s.dialer.Load()
-	if dp == nil {
+	if s.loadDialer() == nil {
 		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-		s.warnLog("http", target, "no dialer")
+		s.warnLog("http", req.URL.String(), "no dialer")
 		return
 	}
 
-	if method == "CONNECT" {
-		remote, err := (*dp).DialContext(context.Background(), "tcp", target)
+	target := req.Host
+	if target == "" {
+		target = req.URL.Host
+	}
+	if target == "" {
+		conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+		s.warnLog("http", "", "missing target host")
+		return
+	}
+	if !strings.Contains(target, ":") {
+		port := "80"
+		if req.Method == "CONNECT" || req.URL.Scheme == "https" {
+			port = "443"
+		}
+		target = net.JoinHostPort(target, port)
+	}
+
+	if req.Method == "CONNECT" {
+		remote, err := s.dial("tcp", target)
 		if err != nil {
 			conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
 			s.warnLog("http", target, err.Error())
@@ -297,22 +325,32 @@ func (s *Server) handleHTTP(conn net.Conn, br *bufio.Reader) {
 		defer remote.Close()
 		conn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 		up, down := relay(conn, remote)
-		s.reqLog("http", method, target, "ok", time.Since(start).Milliseconds(), up, down)
-	} else {
-		remote, err := (*dp).DialContext(context.Background(), "tcp", target)
-		if err != nil {
-			conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
-			s.warnLog("http", target, err.Error())
-			return
-		}
-		defer remote.Close()
-		fmt.Fprintf(remote, "%s %s %s\r\n", method, target, parts[2])
-		fmt.Fprintf(remote, "Connection: close\r\n\r\n")
-		up, _ := io.Copy(remote, br)
-		if c, ok := remote.(*net.TCPConn); ok {
-			c.CloseWrite()
-		}
-		down, _ := io.Copy(conn, remote)
-		s.reqLog("http", method, target, "ok", time.Since(start).Milliseconds(), up, down)
+		s.reqLog("http", req.Method, target, "ok", time.Since(start).Milliseconds(), up, down)
+		return
 	}
+
+	remote, err := s.dial("tcp", target)
+	if err != nil {
+		conn.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+		s.warnLog("http", target, err.Error())
+		return
+	}
+	defer remote.Close()
+	if req.Body != nil {
+		defer req.Body.Close()
+	}
+	req.Header.Del("Proxy-Connection")
+	req.Header.Set("Connection", "close")
+	req.RequestURI = ""
+	req.URL.Scheme = ""
+	req.URL.Host = ""
+	if err := req.Write(remote); err != nil {
+		s.warnLog("http", target, err.Error())
+		return
+	}
+	if c, ok := remote.(*net.TCPConn); ok {
+		c.CloseWrite()
+	}
+	down, _ := io.Copy(conn, remote)
+	s.reqLog("http", req.Method, target, "ok", time.Since(start).Milliseconds(), 0, down)
 }

@@ -60,15 +60,18 @@ func testServer(name string) string {
 
 func multiSourceConfig() *config.Config {
 	return &config.Config{
-		Bind:               "127.0.0.1",
-		BasePort:           28081,
-		StatusPort:         28080,
-		ProbeURLs:          []string{"http://127.0.0.1:9999"},
-		ProbeTimeout:       2 * time.Second,
-		HealthInterval:     1 * time.Hour,
-		RefreshInterval:    1 * time.Hour,
-		DialTimeout:        2 * time.Second,
-		MaxConcurrentProbe: 4,
+		Bind:                "127.0.0.1",
+		BasePort:            28081,
+		StatusPort:          28080,
+		ProbeURLs:           []string{"http://127.0.0.1:9999"},
+		ProbeTimeout:        2 * time.Second,
+		HealthInterval:      1 * time.Hour,
+		RefreshInterval:     1 * time.Hour,
+		DialTimeout:         2 * time.Second,
+		MaxConcurrentProbe:  4,
+		TrafficProbeURL:     "http://127.0.0.1:9999",
+		TrafficProbeTimeout: 2 * time.Second,
+		SlowLatency:         2 * time.Second,
 		Sources: []config.Source{
 			{Tag: "legacy", Type: config.SourceClash, URL: "http://legacy"},
 			{Tag: "vpncheap", Type: config.SourceSingBox, URL: "http://vpncheap"},
@@ -88,13 +91,17 @@ func multiSourceCacheConfig() *config.Config {
 func newTestManager(t *testing.T, cfg *config.Config) *Manager {
 	t.Helper()
 	cfg.StateFile = t.TempDir() + "/state.json"
-	return &Manager{
+	m := &Manager{
 		cfg:       cfg,
 		alloc:     allocNew(cfg.BasePort),
 		entries:   make(map[string]*entry),
 		logger:    slog.Default(),
 		fetchFunc: sub.Fetch,
 	}
+	m.directTraffic = func(ctx context.Context) (probe.Result, error) {
+		return probe.Result{Latency: time.Millisecond}, nil
+	}
+	return m
 }
 
 func TestRefreshMultiSource(t *testing.T) {
@@ -176,6 +183,26 @@ func TestRefreshAllSourcesFail(t *testing.T) {
 	}
 	if len(m.Snapshot()) != 0 {
 		t.Fatalf("expected 0 entries, got %d", len(m.Snapshot()))
+	}
+}
+
+func TestRefreshContinuesWhenDirectTrafficFails(t *testing.T) {
+	m := newTestManager(t, multiSourceConfig())
+	m.fetchFunc = func(ctx context.Context, url string) ([]byte, error) {
+		return clashSub("srv1"), nil
+	}
+	m.probeNode = func(ctx context.Context, node sub.Node) (probe.Result, error) {
+		return probe.Result{IP: "10.0.0.1", Latency: 10 * time.Millisecond}, nil
+	}
+	m.directTraffic = func(ctx context.Context) (probe.Result, error) {
+		return probe.Result{}, errors.New("direct target unreachable")
+	}
+
+	if err := m.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("refreshOnce should continue when direct traffic probe fails: %v", err)
+	}
+	if len(m.Snapshot()) != 1 {
+		t.Fatalf("expected 1 entry from node probe, got %d", len(m.Snapshot()))
 	}
 }
 

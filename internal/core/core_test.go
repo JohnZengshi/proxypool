@@ -4,9 +4,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/john/proxypool/internal/buildcheck"
 	"github.com/john/proxypool/internal/sub"
 	"github.com/sagernet/sing-box/option"
 )
+
+func hysteria2BuildAvailable() bool {
+	return buildcheck.VerifyBuildTags() == nil
+}
 
 func outboundFor(t *testing.T, typ, tag, server string, port uint16, opts any) sub.Node {
 	t.Helper()
@@ -54,6 +59,9 @@ func TestNewOutboundAllProtocols(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.typ, func(t *testing.T) {
+			if c.typ == "hysteria2" && !hysteria2BuildAvailable() {
+				t.Skip("hysteria2 requires -tags with_quic")
+			}
 			node := outboundFor(t, c.typ, "test-"+c.typ, "127.0.0.1", 443, c.opts)
 			d, err := NewOutbound(node, 5*time.Second)
 			if err != nil {
@@ -70,6 +78,9 @@ func TestNewOutboundAllProtocols(t *testing.T) {
 }
 
 func TestNewOutboundHysteria2(t *testing.T) {
+	if !hysteria2BuildAvailable() {
+		t.Skip("hysteria2 requires -tags with_quic")
+	}
 	node := outboundFor(t, "hysteria2", "hy2-1", "127.0.0.1", 8443, &option.Hysteria2OutboundOptions{
 		ServerOptions: option.ServerOptions{Server: "127.0.0.1", ServerPort: 8443},
 		Password:      "test-password",

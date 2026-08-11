@@ -22,31 +22,37 @@ import (
 )
 
 type NodeStatus struct {
-	Port      int       `json:"port"`
-	ExitIP    string    `json:"exit_ip"`
-	Tag       string    `json:"tag"`
-	Type      string    `json:"type"`
-	NodeName  string    `json:"node_name"`
-	LatencyMS int64     `json:"latency_ms"`
-	Healthy   bool      `json:"healthy"`
-	LastCheck time.Time `json:"last_check"`
+	Port          int       `json:"port"`
+	ExitIP        string    `json:"exit_ip"`
+	Tag           string    `json:"tag"`
+	Type          string    `json:"type"`
+	NodeName      string    `json:"node_name"`
+	LatencyMS     int64     `json:"latency_ms"`
+	Healthy       bool      `json:"healthy"`
+	LastCheck     time.Time `json:"last_check"`
+	LastError     string    `json:"last_error"`
+	FailCount     int       `json:"fail_count"`
+	SlowLatencyMS int64     `json:"slow_latency_ms"`
 }
 
 type entry struct {
-	node      sub.Node
-	dialer    core.Dialer
-	exitIP    string
-	port      int
-	tag       string
-	ntype     string
-	server    *listen.Server
-	healthy   bool
-	latency   time.Duration
-	lastCheck time.Time
-	hist      [180]Sample
-	histLen   int
-	histNext  int
-	probing   atomic.Bool
+	node       sub.Node
+	dialer     core.Dialer
+	exitIP     string
+	port       int
+	tag        string
+	ntype      string
+	server     *listen.Server
+	healthy    bool
+	latency    time.Duration
+	lastCheck  time.Time
+	lastError  string
+	hist       [180]Sample
+	histLen    int
+	histNext   int
+	probing    atomic.Bool
+	failCount  int
+	generation int
 }
 
 type Sample struct {
@@ -77,6 +83,8 @@ func (e *entry) history() []Sample {
 
 var ErrPortNotFound = errors.New("port not found")
 
+const healthFailLimit = 3
+
 type Manager struct {
 	cfg       *config.Config
 	alloc     *alloc.Allocator
@@ -93,25 +101,66 @@ type Manager struct {
 	// probeNode probes one node, returning exit IP/latency. Defaults to
 	// building a sing-box dialer and probing; tests override it to skip network.
 	probeNode func(ctx context.Context, node sub.Node) (probe.Result, error)
+	// probeTraffic probes one existing node's dialer against the configured
+	// traffic URL. probeExit refreshes only the node's exit IP metadata.
+	probeTraffic func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error)
+	probeExit    func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error)
+	// directTraffic confirms the traffic probe target is reachable without a
+	// proxy before a health round can mark nodes unhealthy.
+	directTraffic func(ctx context.Context) (probe.Result, error)
 }
 
 func New(cfg *config.Config, logger *slog.Logger) *Manager {
-	return &Manager{
+	m := &Manager{
 		cfg:       cfg,
 		alloc:     alloc.New(cfg.BasePort),
 		entries:   make(map[string]*entry),
 		logger:    logger,
 		fetchFunc: sub.Fetch,
 		loadFunc:  sub.Load,
-		probeNode: func(ctx context.Context, node sub.Node) (probe.Result, error) {
-			d, err := core.NewOutbound(node, cfg.DialTimeout)
-			if err != nil {
-				return probe.Result{}, err
-			}
-			defer d.Close()
+		probeTraffic: func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
+			return probe.HTTPSuccessAny(ctx, d, cfg.TrafficProbeTargets(), cfg.TrafficProbeTimeout)
+		},
+		probeExit: func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
 			return probe.Exit(ctx, d, cfg.ProbeURLs, cfg.ProbeTimeout)
 		},
+		directTraffic: func(ctx context.Context) (probe.Result, error) {
+			return probe.DirectHTTPSuccessAny(ctx, cfg.TrafficProbeTargets(), cfg.TrafficProbeTimeout)
+		},
 	}
+	m.probeNode = func(ctx context.Context, node sub.Node) (probe.Result, error) {
+		return m.probeNodeDefault(ctx, node)
+	}
+	return m
+}
+
+func (m *Manager) probeNodeDefault(ctx context.Context, node sub.Node) (probe.Result, error) {
+	d, err := core.NewOutbound(node, m.cfg.DialTimeout)
+	if err != nil {
+		return probe.Result{}, err
+	}
+	defer d.Close()
+
+	traffic, err := m.probeTraffic(ctx, node, d)
+	if err != nil {
+		return traffic, err
+	}
+	exit, err := m.probeExit(ctx, node, d)
+	if err != nil {
+		return traffic, err
+	}
+	traffic.IP = exit.IP
+	return traffic, nil
+}
+
+func (m *Manager) checkDirectTraffic(ctx context.Context) error {
+	if m.directTraffic == nil || len(m.cfg.TrafficProbeTargets()) == 0 {
+		return nil
+	}
+	if _, err := m.directTraffic(ctx); err != nil {
+		return fmt.Errorf("direct traffic probe: %w", err)
+	}
+	return nil
 }
 
 func (m *Manager) Bootstrap(ctx context.Context) error {
@@ -178,6 +227,9 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := m.checkDirectTraffic(ctx); err != nil {
+		m.logger.Warn("direct traffic probe unavailable; continuing with node probes", "err", err)
+	}
 	result := &sub.FetchResult{Nodes: nodes}
 
 	type probeResult struct {
@@ -233,16 +285,19 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 		key := r.node.Key()
 		activeKeys[key] = true
 
-		port, err := m.alloc.Port(ip)
+		port, err := m.alloc.PortFor(key, ip)
 		if err != nil {
 			m.logger.Error("port alloc failed", "ip", ip, "err", err)
 			continue
 		}
 
 		if e, ok := m.entries[key]; ok {
+			e.generation++
 			e.healthy = true
 			e.latency = r.latency
 			e.lastCheck = time.Now()
+			e.failCount = 0
+			e.lastError = ""
 			if e.server != nil {
 				e.server.SetDialer(e.dialer)
 			}
@@ -255,23 +310,24 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 			continue
 		}
 
-		srv := listen.New(net.JoinHostPort(m.cfg.Bind, itoa(port)), port, m.logger, m.cfg.LogRequests)
+		srv := listen.New(net.JoinHostPort(m.cfg.Bind, itoa(port)), port, m.logger, m.cfg.LogRequests, m.cfg.DialTimeout)
 		srv.SetDialer(d)
 		srv.SetExitIP(ip)
 		srv.SetTag(r.node.Tag)
 		go srv.Serve()
 
 		m.entries[key] = &entry{
-			node:      r.node,
-			dialer:    d,
-			exitIP:    ip,
-			port:      port,
-			tag:       r.node.Tag,
-			ntype:     r.node.Type,
-			server:    srv,
-			healthy:   true,
-			latency:   r.latency,
-			lastCheck: time.Now(),
+			node:       r.node,
+			dialer:     d,
+			exitIP:     ip,
+			port:       port,
+			tag:        r.node.Tag,
+			ntype:      r.node.Type,
+			server:     srv,
+			healthy:    true,
+			latency:    r.latency,
+			lastCheck:  time.Now(),
+			generation: 1,
 		}
 		m.logger.Info("proxy started", "port", port, "exit_ip", ip, "tag", r.node.Tag, "node", maskUUID(r.node.Name), "latency", r.latency)
 	}
@@ -281,10 +337,9 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 			continue
 		}
 		if !activeKeys[key] {
+			e.generation++
 			e.healthy = false
-			if e.server != nil {
-				e.server.SetDialer(nil)
-			}
+			e.lastError = "node removed from active subscription"
 			m.logger.Info("node marked unhealthy", "port", e.port, "exit_ip", e.exitIP, "tag", e.tag, "node", maskUUID(e.node.Name))
 		}
 	}
@@ -295,43 +350,95 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 	if m.OnRefresh != nil {
 		m.OnRefresh()
 	}
+	m.printProxyAddresses()
 	return nil
+}
+
+func (m *Manager) proxyAddresses() []string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	type addressEntry struct {
+		addr    string
+		latency time.Duration
+		port    int
+	}
+	entries := make([]addressEntry, 0, len(m.entries))
+	for _, e := range m.entries {
+		if e.healthy && e.server != nil {
+			entries = append(entries, addressEntry{
+				addr:    "http://" + net.JoinHostPort(m.cfg.Bind, itoa(e.port)),
+				latency: e.latency,
+				port:    e.port,
+			})
+		}
+	}
+	sort.Slice(entries, func(i, j int) bool {
+		if entries[i].latency != entries[j].latency {
+			return entries[i].latency < entries[j].latency
+		}
+		return entries[i].port < entries[j].port
+	})
+	addrs := make([]string, len(entries))
+	for i := range entries {
+		addrs[i] = entries[i].addr
+	}
+	return addrs
+}
+
+func (m *Manager) printProxyAddresses() {
+	for _, addr := range m.proxyAddresses() {
+		fmt.Println(addr)
+	}
 }
 
 func (m *Manager) healthLoop(ctx context.Context) {
 	defer m.wg.Done()
-	ticker := time.NewTicker(m.cfg.HealthInterval)
-	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
+		case <-time.After(m.cfg.HealthInterval):
 			m.checkHealth(ctx)
 		}
 	}
 }
 
 func (m *Manager) checkHealth(ctx context.Context) {
+	if err := m.checkDirectTraffic(ctx); err != nil {
+		m.logger.Warn("health round skipped", "err", err)
+		return
+	}
 	m.mu.RLock()
 	entries := make([]*entry, 0, len(m.entries))
 	for _, e := range m.entries {
 		entries = append(entries, e)
 	}
 	m.mu.RUnlock()
+	m.probeEntries(ctx, entries)
+	m.mu.Lock()
+	m.alloc.Save(m.cfg.StateFile)
+	m.mu.Unlock()
+}
 
+func (m *Manager) probeEntries(ctx context.Context, entries []*entry) {
+	limit := m.cfg.MaxConcurrentProbe
+	if limit < 1 {
+		limit = 1
+	}
+	sem := semaphore.NewWeighted(int64(limit))
 	var wg sync.WaitGroup
 	for _, e := range entries {
 		wg.Add(1)
 		go func(e *entry) {
 			defer wg.Done()
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return
+			}
+			defer sem.Release(1)
 			m.probeEntry(ctx, e)
 		}(e)
 	}
 	wg.Wait()
-	m.mu.Lock()
-	m.alloc.Save(m.cfg.StateFile)
-	m.mu.Unlock()
 }
 
 func (m *Manager) probeEntry(ctx context.Context, e *entry) {
@@ -340,45 +447,77 @@ func (m *Manager) probeEntry(ctx context.Context, e *entry) {
 	}
 	defer e.probing.Store(false)
 
-	if m.probeNode == nil || e.dialer == nil {
+	m.mu.RLock()
+	d := e.dialer
+	gen := e.generation
+	m.mu.RUnlock()
+	if d == nil {
 		return
 	}
-	res, err := probe.Exit(ctx, e.dialer, m.cfg.ProbeURLs, m.cfg.ProbeTimeout)
+	var (
+		res probe.Result
+		err error
+	)
+	if m.probeTraffic != nil {
+		res, err = m.probeTraffic(ctx, e.node, d)
+	} else if m.probeNode != nil {
+		res, err = m.probeNode(ctx, e.node)
+	} else {
+		err = fmt.Errorf("no traffic probe configured")
+	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if gen != e.generation || d != e.dialer {
+		m.mu.Unlock()
+		return
+	}
 	e.lastCheck = time.Now()
 	if err != nil {
-		e.healthy = false
-		e.addSample(Sample{TS: time.Now(), LatencyMS: 0, Healthy: false})
-		if e.server != nil {
-			e.server.SetDialer(nil)
+		e.lastError = err.Error()
+		e.failCount++
+		if e.failCount >= healthFailLimit {
+			e.healthy = false
 		}
+		e.addSample(Sample{TS: time.Now(), LatencyMS: 0, Healthy: false})
 		m.logger.Warn("probe failed", "port", e.port, "err", err)
+		m.mu.Unlock()
 		return
 	}
-	if res.IP != e.exitIP {
-		newPort, err := m.alloc.Port(res.IP)
-		if err != nil {
-			m.logger.Error("port realloc failed", "ip", res.IP, "err", err)
-			return
-		}
-		e.exitIP = res.IP
-		e.port = newPort
-		if e.server != nil {
-			e.server.Close()
-			e.server = listen.New(net.JoinHostPort(m.cfg.Bind, itoa(newPort)), newPort, m.logger, m.cfg.LogRequests)
-			e.server.SetDialer(e.dialer)
-			e.server.SetExitIP(res.IP)
-			e.server.SetTag(e.tag)
-			go e.server.Serve()
-		}
-	}
+	e.failCount = 0
 	e.healthy = true
 	e.latency = res.Latency
+	e.lastError = ""
 	e.addSample(Sample{TS: time.Now(), LatencyMS: res.Latency.Milliseconds(), Healthy: true})
-	if e.server != nil {
-		e.server.SetDialer(e.dialer)
+	if e.dialer != d || e.server == nil {
+		m.mu.Unlock()
+		return
 	}
+	if e.server != nil {
+		e.server.SetDialer(d)
+	}
+	if m.probeExit == nil {
+		m.mu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+
+	exitRes, exitErr := m.probeExit(ctx, e.node, d)
+	if exitErr != nil {
+		m.logger.Warn("exit identify failed", "port", e.port, "err", exitErr)
+		return
+	}
+	m.mu.Lock()
+	if gen != e.generation || d != e.dialer {
+		m.mu.Unlock()
+		return
+	}
+	if exitRes.IP != "" && exitRes.IP != e.exitIP {
+		m.alloc.RetainPort(e.node.Key(), e.port)
+		e.exitIP = exitRes.IP
+		if e.server != nil {
+			e.server.SetExitIP(exitRes.IP)
+		}
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) ProbeNow(ctx context.Context, port int) error {
@@ -401,16 +540,11 @@ func (m *Manager) ProbeNow(ctx context.Context, port int) error {
 	if len(targets) == 0 {
 		return ErrPortNotFound
 	}
-
-	var wg sync.WaitGroup
-	for _, e := range targets {
-		wg.Add(1)
-		go func(e *entry) {
-			defer wg.Done()
-			m.probeEntry(ctx, e)
-		}(e)
+	if err := m.checkDirectTraffic(ctx); err != nil {
+		return err
 	}
-	wg.Wait()
+
+	m.probeEntries(ctx, targets)
 	return nil
 }
 
@@ -436,14 +570,17 @@ func (m *Manager) Snapshot() []NodeStatus {
 	statuses := make([]NodeStatus, 0, len(m.entries))
 	for _, e := range m.entries {
 		statuses = append(statuses, NodeStatus{
-			Port:      e.port,
-			ExitIP:    e.exitIP,
-			Tag:       e.tag,
-			Type:      e.ntype,
-			NodeName:  maskUUID(e.node.Name),
-			LatencyMS: e.latency.Milliseconds(),
-			Healthy:   e.healthy,
-			LastCheck: e.lastCheck,
+			Port:          e.port,
+			ExitIP:        e.exitIP,
+			Tag:           e.tag,
+			Type:          e.ntype,
+			NodeName:      maskUUID(e.node.Name),
+			LatencyMS:     e.latency.Milliseconds(),
+			Healthy:       e.healthy,
+			LastCheck:     e.lastCheck,
+			LastError:     e.lastError,
+			FailCount:     e.failCount,
+			SlowLatencyMS: m.cfg.SlowLatency.Milliseconds(),
 		})
 	}
 	sort.Slice(statuses, func(i, j int) bool {
@@ -475,6 +612,11 @@ func (m *Manager) Close() error {
 		}
 		if e.dialer != nil {
 			e.dialer.Close()
+		}
+	}
+	if m.cfg != nil && m.cfg.StateFile != "" && m.alloc != nil {
+		if err := m.alloc.Save(m.cfg.StateFile); err != nil && m.logger != nil {
+			m.logger.Warn("state save failed", "err", err)
 		}
 	}
 	return nil

@@ -21,10 +21,31 @@ func New(basePort int) *Allocator {
 	}
 }
 
-func (a *Allocator) Port(exitIP string) (int, error) {
-	if p, ok := a.m[exitIP]; ok {
+func (a *Allocator) Port(key string) (int, error) {
+	if p, ok := a.m[key]; ok {
 		return p, nil
 	}
+	return a.newPort(key)
+}
+
+// PortFor returns the port for a stable node key, claiming the previous
+// exit-IP mapping when this is the first run after the keyed-state migration.
+func (a *Allocator) PortFor(key, legacyKey string) (int, error) {
+	if p, ok := a.m[key]; ok {
+		return p, nil
+	}
+	if legacyKey != "" {
+		if p, ok := a.m[legacyKey]; ok {
+			delete(a.m, legacyKey)
+			a.m[key] = p
+			a.used[p] = true
+			return p, nil
+		}
+	}
+	return a.newPort(key)
+}
+
+func (a *Allocator) newPort(key string) (int, error) {
 	p := a.basePort
 	for a.used[p] {
 		p++
@@ -32,7 +53,7 @@ func (a *Allocator) Port(exitIP string) (int, error) {
 			return 0, fmt.Errorf("port range exhausted")
 		}
 	}
-	a.m[exitIP] = p
+	a.m[key] = p
 	a.used[p] = true
 	return p, nil
 }
@@ -73,4 +94,15 @@ func (a *Allocator) Save(path string) error {
 		return err
 	}
 	return os.Rename(tmp, path)
+}
+
+// RetainPort keeps an already-bound listener port stable under its node key.
+func (a *Allocator) RetainPort(key string, port int) {
+	for oldKey, p := range a.m {
+		if p == port && oldKey != key {
+			delete(a.m, oldKey)
+		}
+	}
+	a.m[key] = port
+	a.used[port] = true
 }

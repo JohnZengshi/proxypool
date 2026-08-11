@@ -1,5 +1,6 @@
 state.json
 config.yaml
-proxypool
+/proxypool
+/proxypool.exe
 .omo/
 .codegraph/
