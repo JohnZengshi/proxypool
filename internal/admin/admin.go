@@ -63,18 +63,20 @@ main{padding:16px 20px;max-width:1280px;margin:0 auto}
 .pill b{color:var(--text)}
 .filters{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 select{border:1px solid var(--border);border-radius:6px;background:#fff;padding:7px 9px;font:inherit}
-.table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow:auto}
-table{width:100%;border-collapse:collapse;min-width:880px}
-th,td{padding:10px 12px;text-align:left;border-bottom:1px solid #e5e8ed;white-space:nowrap}
+.table-wrap{background:var(--panel);border:1px solid var(--border);border-radius:8px;overflow-x:clip}
+table{width:100%;border-collapse:collapse;min-width:0;table-layout:fixed}
+th,td{padding:10px 8px;text-align:left;border-bottom:1px solid #e5e8ed;white-space:normal;overflow-wrap:anywhere;word-break:break-word;vertical-align:top}
 th{background:#fafbfc;color:var(--muted);font-weight:600;position:sticky;top:0}
 tr:last-child td{border-bottom:0}
-td.proxy{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px}
+td.proxy{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:12px;overflow-wrap:anywhere}
 .status{display:inline-flex;align-items:center;gap:6px}
 .dot{width:8px;height:8px;border-radius:50%;background:#d1d5db}
 .ok .dot{background:var(--ok)}.warn .dot,.slow .dot{background:var(--warn)}.bad .dot{background:var(--bad)}
 .latency{font-variant-numeric:tabular-nums}
-.err{max-width:280px;overflow:hidden;text-overflow:ellipsis;color:var(--muted)}
-svg{display:block}
+.err{color:var(--muted);white-space:normal;overflow:visible;text-overflow:clip}
+svg{display:block;width:100%;max-width:160px;height:auto}
+td.actions{white-space:normal}
+td.actions button{white-space:nowrap;margin:2px 4px 2px 0}
 .empty{padding:34px;text-align:center;color:var(--muted)}
 .error{position:fixed;right:16px;bottom:16px;max-width:380px;background:#7f1d1d;color:#fff;border-radius:8px;padding:12px 14px;display:none;box-shadow:0 8px 24px rgb(0 0 0 / 20%)}
 @media(max-width:640px){header{align-items:flex-start;flex-direction:column}main{padding:10px}}
@@ -134,7 +136,7 @@ function render(){
   el("empty").style.display=filtered.length?"none":"block";
   el("rows").innerHTML=filtered.map(n=>{
     const cls=statusFor(n);
-    return '<tr data-port="'+n.port+'"><td>'+n.port+'</td><td class="proxy">http://127.0.0.1:'+n.port+'</td><td>'+esc(n.exit_ip||"-")+'</td><td><span class="status '+cls+'"><span class="dot"></span>'+statuses[cls]+'</span></td><td class="latency '+latencyClass(n.latency_ms)+'">'+latencyText(n.latency_ms)+'</td><td class="err" title="'+esc(n.last_error||"")+'">'+esc(n.last_error||"-")+'</td><td>'+esc(n.tag||"-")+'</td><td>'+esc(n.node_name||"-")+'</td><td>'+spark(n.port)+'</td><td><button data-probe="'+n.port+'">探测</button><button data-reconnect="'+n.port+'">重连</button></td></tr>';
+    return '<tr data-port="'+n.port+'"><td>'+n.port+'</td><td class="proxy">http://127.0.0.1:'+n.port+'</td><td>'+esc(n.exit_ip||"-")+'</td><td><span class="status '+cls+'"><span class="dot"></span>'+statuses[cls]+'</span></td><td class="latency '+latencyClass(n.latency_ms)+'">'+latencyText(n.latency_ms)+'</td><td class="err" title="'+esc(n.last_error||"")+'">'+esc(n.last_error||"-")+'</td><td>'+esc(n.tag||"-")+'</td><td>'+esc(n.node_name||"-")+'</td><td>'+spark(n.port)+'</td><td class="actions"><button data-probe="'+n.port+'">探测</button><button data-reconnect="'+n.port+'">重连</button></td></tr>';
   }).join("");
   el("updated").textContent="更新 "+new Date().toLocaleTimeString();
 }
