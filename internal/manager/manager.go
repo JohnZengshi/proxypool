@@ -101,6 +101,9 @@ type Manager struct {
 	// probeNode probes one node, returning exit IP/latency. Defaults to
 	// building a sing-box dialer and probing; tests override it to skip network.
 	probeNode func(ctx context.Context, node sub.Node) (probe.Result, error)
+	// newOutbound creates the dialer used by one local proxy port. Tests
+	// override it to avoid real network dialers.
+	newOutbound func(node sub.Node, dialTimeout time.Duration) (core.Dialer, error)
 	// probeTraffic probes one existing node's dialer against the configured
 	// traffic URL. probeExit refreshes only the node's exit IP metadata.
 	probeTraffic func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error)
@@ -112,12 +115,13 @@ type Manager struct {
 
 func New(cfg *config.Config, logger *slog.Logger) *Manager {
 	m := &Manager{
-		cfg:       cfg,
-		alloc:     alloc.New(cfg.BasePort),
-		entries:   make(map[string]*entry),
-		logger:    logger,
-		fetchFunc: sub.Fetch,
-		loadFunc:  sub.Load,
+		cfg:         cfg,
+		alloc:       alloc.New(cfg.BasePort),
+		entries:     make(map[string]*entry),
+		logger:      logger,
+		fetchFunc:   sub.Fetch,
+		loadFunc:    sub.Load,
+		newOutbound: core.NewOutbound,
 		probeTraffic: func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
 			return probe.HTTPSuccessAny(ctx, d, cfg.TrafficProbeTargets(), cfg.TrafficProbeTimeout)
 		},
@@ -135,7 +139,7 @@ func New(cfg *config.Config, logger *slog.Logger) *Manager {
 }
 
 func (m *Manager) probeNodeDefault(ctx context.Context, node sub.Node) (probe.Result, error) {
-	d, err := core.NewOutbound(node, m.cfg.DialTimeout)
+	d, err := m.outboundFor(node)
 	if err != nil {
 		return probe.Result{}, err
 	}
@@ -151,6 +155,13 @@ func (m *Manager) probeNodeDefault(ctx context.Context, node sub.Node) (probe.Re
 	}
 	traffic.IP = exit.IP
 	return traffic, nil
+}
+
+func (m *Manager) outboundFor(node sub.Node) (core.Dialer, error) {
+	if m.newOutbound != nil {
+		return m.newOutbound(node, m.cfg.DialTimeout)
+	}
+	return core.NewOutbound(node, m.cfg.DialTimeout)
 }
 
 func (m *Manager) checkDirectTraffic(ctx context.Context) error {
@@ -236,7 +247,7 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 		node    sub.Node
 		exitIP  string
 		latency time.Duration
-		ok      bool
+		err     error
 	}
 
 	sem := semaphore.NewWeighted(int64(m.cfg.MaxConcurrentProbe))
@@ -247,89 +258,100 @@ func (m *Manager) refreshOnce(ctx context.Context) error {
 		wg.Add(1)
 		go func(idx int, n sub.Node) {
 			defer wg.Done()
-			sem.Acquire(ctx, 1)
+			if err := sem.Acquire(ctx, 1); err != nil {
+				results[idx] = probeResult{node: n, err: err}
+				return
+			}
 			defer sem.Release(1)
 
 			res, err := m.probeNode(ctx, n)
 			if err != nil {
-				m.logger.Warn("probe failed", "node", maskUUID(n.Name), "err", err)
+				results[idx] = probeResult{node: n, err: err}
 				return
 			}
-			results[idx] = probeResult{node: n, exitIP: res.IP, latency: res.Latency, ok: true}
+			results[idx] = probeResult{node: n, exitIP: res.IP, latency: res.Latency}
 		}(i, node)
 	}
 	wg.Wait()
 
-	bestByIP := make(map[string]probeResult)
-	for _, r := range results {
-		if !r.ok {
-			continue
-		}
-		existing, found := bestByIP[r.exitIP]
-		if !found || r.latency < existing.latency {
-			bestByIP[r.exitIP] = r
-		}
-	}
-
-	var ips []string
-	for ip := range bestByIP {
-		ips = append(ips, ip)
-	}
-	sort.Strings(ips)
-
 	m.mu.Lock()
 
 	activeKeys := make(map[string]bool)
-	for _, ip := range ips {
-		r := bestByIP[ip]
+	for _, r := range results {
 		key := r.node.Key()
 		activeKeys[key] = true
 
-		port, err := m.alloc.PortFor(key, ip)
+		port, err := m.alloc.PortFor(key, r.exitIP)
 		if err != nil {
-			m.logger.Error("port alloc failed", "ip", ip, "err", err)
+			m.logger.Error("port alloc failed", "node", maskUUID(r.node.Name), "err", err)
 			continue
 		}
 
 		if e, ok := m.entries[key]; ok {
 			e.generation++
-			e.healthy = true
-			e.latency = r.latency
+			e.node = r.node
+			e.tag = r.node.Tag
+			e.ntype = r.node.Type
 			e.lastCheck = time.Now()
-			e.failCount = 0
-			e.lastError = ""
-			if e.server != nil {
-				e.server.SetDialer(e.dialer)
+			if r.err != nil {
+				e.lastError = r.err.Error()
+				e.failCount++
+				e.addSample(Sample{TS: time.Now(), LatencyMS: 0, Healthy: false})
+				if e.failCount >= healthFailLimit {
+					e.healthy = false
+				}
+				m.logger.Warn("probe failed", "port", e.port, "node", maskUUID(r.node.Name), "err", r.err)
+			} else {
+				e.healthy = true
+				e.latency = r.latency
+				e.failCount = 0
+				e.lastError = ""
+				e.exitIP = r.exitIP
+				e.addSample(Sample{TS: time.Now(), LatencyMS: r.latency.Milliseconds(), Healthy: true})
+				if e.server != nil {
+					e.server.SetDialer(e.dialer)
+					e.server.SetExitIP(r.exitIP)
+				}
 			}
 			continue
 		}
 
-		d, err := core.NewOutbound(r.node, m.cfg.DialTimeout)
+		d, err := m.outboundFor(r.node)
 		if err != nil {
-			m.logger.Error("recreate outbound failed", "node", maskUUID(r.node.Name), "err", err)
+			m.logger.Error("create outbound failed", "node", maskUUID(r.node.Name), "err", err)
 			continue
 		}
 
 		srv := listen.New(net.JoinHostPort(m.cfg.Bind, itoa(port)), port, m.logger, m.cfg.LogRequests, m.cfg.DialTimeout)
 		srv.SetDialer(d)
-		srv.SetExitIP(ip)
+		srv.SetExitIP(r.exitIP)
 		srv.SetTag(r.node.Tag)
 		go srv.Serve()
 
-		m.entries[key] = &entry{
+		e := &entry{
 			node:       r.node,
 			dialer:     d,
-			exitIP:     ip,
+			exitIP:     r.exitIP,
 			port:       port,
 			tag:        r.node.Tag,
 			ntype:      r.node.Type,
 			server:     srv,
-			healthy:    true,
-			latency:    r.latency,
+			healthy:    false,
 			lastCheck:  time.Now(),
 			generation: 1,
 		}
-		m.logger.Info("proxy started", "port", port, "exit_ip", ip, "tag", r.node.Tag, "node", maskUUID(r.node.Name), "latency", r.latency)
+		if r.err == nil {
+			e.healthy = true
+			e.latency = r.latency
+			e.addSample(Sample{TS: time.Now(), LatencyMS: r.latency.Milliseconds(), Healthy: true})
+			m.logger.Info("proxy started", "port", port, "exit_ip", r.exitIP, "tag", r.node.Tag, "node", maskUUID(r.node.Name), "latency", r.latency)
+		} else {
+			e.failCount = 1
+			e.lastError = r.err.Error()
+			e.addSample(Sample{TS: time.Now(), LatencyMS: 0, Healthy: false})
+			m.logger.Warn("proxy started offline", "port", port, "tag", r.node.Tag, "node", maskUUID(r.node.Name), "err", r.err)
+		}
+		m.entries[key] = e
 	}
 
 	for key, e := range m.entries {
@@ -521,22 +543,7 @@ func (m *Manager) probeEntry(ctx context.Context, e *entry) {
 }
 
 func (m *Manager) ProbeNow(ctx context.Context, port int) error {
-	m.mu.RLock()
-	var targets []*entry
-	if port == 0 {
-		for _, e := range m.entries {
-			targets = append(targets, e)
-		}
-	} else {
-		for _, e := range m.entries {
-			if e.port == port {
-				targets = append(targets, e)
-				break
-			}
-		}
-	}
-	m.mu.RUnlock()
-
+	targets := m.selectEntries(port)
 	if len(targets) == 0 {
 		return ErrPortNotFound
 	}
@@ -546,6 +553,86 @@ func (m *Manager) ProbeNow(ctx context.Context, port int) error {
 
 	m.probeEntries(ctx, targets)
 	return nil
+}
+
+func (m *Manager) ReconnectNow(ctx context.Context, port int) error {
+	targets := m.selectEntries(port)
+	if len(targets) == 0 {
+		return ErrPortNotFound
+	}
+
+	limit := m.cfg.MaxConcurrentProbe
+	if limit < 1 {
+		limit = 1
+	}
+	sem := semaphore.NewWeighted(int64(limit))
+	var wg sync.WaitGroup
+	for _, e := range targets {
+		wg.Add(1)
+		go func(e *entry) {
+			defer wg.Done()
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return
+			}
+			defer sem.Release(1)
+			m.reconnectEntry(ctx, e)
+		}(e)
+	}
+	wg.Wait()
+	return nil
+}
+
+func (m *Manager) selectEntries(port int) []*entry {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if port == 0 {
+		out := make([]*entry, 0, len(m.entries))
+		for _, e := range m.entries {
+			out = append(out, e)
+		}
+		return out
+	}
+	for _, e := range m.entries {
+		if e.port == port {
+			return []*entry{e}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) reconnectEntry(ctx context.Context, e *entry) {
+	d, err := m.outboundFor(e.node)
+	if err != nil {
+		m.mu.Lock()
+		e.lastCheck = time.Now()
+		e.lastError = "reconnect failed: " + err.Error()
+		e.failCount++
+		e.healthy = false
+		e.addSample(Sample{TS: time.Now(), LatencyMS: 0, Healthy: false})
+		m.mu.Unlock()
+		m.logger.Warn("reconnect failed", "port", e.port, "err", err)
+		return
+	}
+
+	m.mu.Lock()
+	old := e.dialer
+	e.dialer = d
+	e.generation++
+	if e.server != nil {
+		e.server.SetDialer(d)
+	}
+	m.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
+	m.logger.Info("proxy reconnected", "port", e.port, "node", maskUUID(e.node.Name))
+
+	m.probeEntry(ctx, e)
+	m.mu.Lock()
+	if e.lastError != "" {
+		e.healthy = false
+	}
+	m.mu.Unlock()
 }
 
 func (m *Manager) refreshLoop(ctx context.Context) {

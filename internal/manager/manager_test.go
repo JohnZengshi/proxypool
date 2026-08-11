@@ -29,6 +29,11 @@ type fakeDialer struct {
 	id string
 }
 
+type closingDialer struct {
+	id     string
+	closed atomic.Bool
+}
+
 type trackingDialer struct {
 	active atomic.Int64
 	max    atomic.Int64
@@ -59,6 +64,16 @@ func (f *fakeDialer) DialContext(ctx context.Context, network, addr string) (net
 }
 
 func (f *fakeDialer) Close() error { return nil }
+
+func (d *closingDialer) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	var raw net.Dialer
+	return raw.DialContext(ctx, network, addr)
+}
+
+func (d *closingDialer) Close() error {
+	d.closed.Store(true)
+	return nil
+}
 
 func testConfig(t *testing.T) *config.Config {
 	t.Helper()
@@ -98,6 +113,47 @@ func TestSnapshotSorted(t *testing.T) {
 	}
 	if snap[0].Port != 28081 || snap[1].Port != 28082 || snap[2].Port != 28083 {
 		t.Fatalf("ports not sorted: %d %d %d", snap[0].Port, snap[1].Port, snap[2].Port)
+	}
+}
+
+func TestRefreshCreatesAllNodesIncludingFailed(t *testing.T) {
+	cfg := multiSourceConfig()
+	cfg.Sources = []config.Source{{Tag: "test", Type: config.SourceClash, URL: "http://test"}}
+	m := newTestManager(t, cfg)
+	defer m.Close()
+	m.fetchFunc = func(ctx context.Context, url string) ([]byte, error) {
+		return clashSub("srv1", "srv2"), nil
+	}
+	m.probeNode = func(ctx context.Context, node sub.Node) (probe.Result, error) {
+		if node.Server == testServer("srv1") {
+			return probe.Result{IP: "10.0.0.1", Latency: 10 * time.Millisecond}, nil
+		}
+		return probe.Result{}, errors.New("probe down")
+	}
+
+	if err := m.refreshOnce(context.Background()); err != nil {
+		t.Fatalf("refreshOnce: %v", err)
+	}
+	snap := m.Snapshot()
+	if len(snap) != 2 {
+		t.Fatalf("expected all parsed nodes to be created, got %d: %+v", len(snap), snap)
+	}
+	var online, offline *NodeStatus
+	for i := range snap {
+		if snap[i].Healthy {
+			online = &snap[i]
+		} else {
+			offline = &snap[i]
+		}
+	}
+	if online == nil || offline == nil {
+		t.Fatalf("expected one online and one offline node, got %+v", snap)
+	}
+	if offline.LastError == "" {
+		t.Fatal("offline node should keep probe error")
+	}
+	if online.Port == offline.Port {
+		t.Fatalf("nodes share port %d", online.Port)
 	}
 }
 
@@ -344,6 +400,136 @@ func TestProbeNowPortNotFound(t *testing.T) {
 	err := m.ProbeNow(context.Background(), 65535)
 	if !errors.Is(err, ErrPortNotFound) {
 		t.Fatalf("expected ErrPortNotFound, got %v", err)
+	}
+}
+
+func TestReconnectSingleKeepsPortAndReplacesDialer(t *testing.T) {
+	cfg := testConfig(t)
+	m := &Manager{
+		cfg:     cfg,
+		alloc:   allocNew(28081),
+		entries: make(map[string]*entry),
+		logger:  slog.Default(),
+		newOutbound: func(node sub.Node, timeout time.Duration) (core.Dialer, error) {
+			return &fakeDialer{id: "new"}, nil
+		},
+	}
+	m.probeTraffic = func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
+		return probe.Result{Latency: 25 * time.Millisecond}, nil
+	}
+	m.probeExit = func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
+		return probe.Result{IP: "5.6.7.8"}, nil
+	}
+	old := &closingDialer{id: "old"}
+	e := &entry{
+		node:    subNode("test", "srv1", 443),
+		dialer:  old,
+		port:    28081,
+		tag:     "default",
+		ntype:   "vmess",
+		server:  newListen("127.0.0.1:0"),
+		healthy: true,
+	}
+	m.entries[e.node.Key()] = e
+
+	if err := m.ReconnectNow(context.Background(), 28081); err != nil {
+		t.Fatalf("ReconnectNow: %v", err)
+	}
+	if !old.closed.Load() {
+		t.Fatal("old dialer was not closed")
+	}
+	if e.dialer.(*fakeDialer).id != "new" {
+		t.Fatalf("dialer id = %q, want new", e.dialer.(*fakeDialer).id)
+	}
+	if e.port != 28081 {
+		t.Fatalf("port = %d, want 28081", e.port)
+	}
+	if !e.healthy || e.exitIP != "5.6.7.8" {
+		t.Fatalf("reconnect did not recover node: healthy=%v exitIP=%q", e.healthy, e.exitIP)
+	}
+}
+
+func TestReconnectFailureKeepsDialerAndMarksOffline(t *testing.T) {
+	cfg := testConfig(t)
+	m := &Manager{
+		cfg:     cfg,
+		alloc:   allocNew(28081),
+		entries: make(map[string]*entry),
+		logger:  slog.Default(),
+		newOutbound: func(node sub.Node, timeout time.Duration) (core.Dialer, error) {
+			return nil, errors.New("outbound down")
+		},
+	}
+	old := &closingDialer{id: "old"}
+	e := &entry{
+		node:    subNode("test", "srv1", 443),
+		dialer:  old,
+		port:    28081,
+		server:  newListen("127.0.0.1:0"),
+		healthy: true,
+	}
+	m.entries[e.node.Key()] = e
+
+	if err := m.ReconnectNow(context.Background(), 28081); err != nil {
+		t.Fatalf("ReconnectNow should report action success, got %v", err)
+	}
+	if old.closed.Load() {
+		t.Fatal("old dialer should remain usable when reconnect fails")
+	}
+	if e.healthy {
+		t.Fatal("node should be offline after failed reconnect")
+	}
+	if !strings.Contains(e.lastError, "reconnect failed") {
+		t.Fatalf("lastError = %q, want reconnect failed", e.lastError)
+	}
+}
+
+func TestReconnectAllKeepsPortsAndReplacesDialers(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxConcurrentProbe = 1
+	m := &Manager{
+		cfg:     cfg,
+		alloc:   allocNew(28081),
+		entries: make(map[string]*entry),
+		logger:  slog.Default(),
+		newOutbound: func(node sub.Node, timeout time.Duration) (core.Dialer, error) {
+			return &fakeDialer{id: node.Name}, nil
+		},
+	}
+	m.probeTraffic = func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
+		return probe.Result{Latency: 10 * time.Millisecond}, nil
+	}
+	m.probeExit = func(ctx context.Context, node sub.Node, d core.Dialer) (probe.Result, error) {
+		return probe.Result{IP: "10.0.0.1"}, nil
+	}
+	olds := make([]*closingDialer, 3)
+	for i := range olds {
+		olds[i] = &closingDialer{id: "old" + fmt.Sprint(i)}
+		m.entries[fmt.Sprintf("n%d", i)] = &entry{
+			node:    subNode("n"+fmt.Sprint(i), "srv"+fmt.Sprint(i), 443),
+			dialer:  olds[i],
+			port:    28081 + i,
+			tag:     "default",
+			ntype:   "vmess",
+			server:  newListen("127.0.0.1:0"),
+			healthy: true,
+		}
+	}
+
+	if err := m.ReconnectNow(context.Background(), 0); err != nil {
+		t.Fatalf("ReconnectNow all: %v", err)
+	}
+	for i, old := range olds {
+		if !old.closed.Load() {
+			t.Fatalf("dialer %d was not closed", i)
+		}
+		key := fmt.Sprintf("n%d", i)
+		if m.entries[key].port != 28081+i {
+			t.Fatalf("node %s port changed to %d", key, m.entries[key].port)
+		}
+		if !m.entries[key].healthy {
+			t.Fatalf("node %s did not recover", key)
+		}
 	}
 }
 

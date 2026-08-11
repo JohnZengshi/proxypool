@@ -115,7 +115,7 @@ func TestRefreshMultiSource(t *testing.T) {
 		}
 		return nil, fmt.Errorf("unknown url %s", url)
 	}
-	// srv1 and srv3 share exit IP 10.0.0.1 to prove global dedupe collapses them.
+	// srv1 and srv3 share an exit IP while remaining separate nodes.
 	ipByServer := map[string]string{
 		testServer("srv1"): "10.0.0.1", testServer("srv2"): "10.0.0.2",
 		testServer("srv3"): "10.0.0.1", testServer("srv4"): "10.0.0.3",
@@ -132,8 +132,8 @@ func TestRefreshMultiSource(t *testing.T) {
 		t.Fatalf("refreshOnce: %v", err)
 	}
 	snap := m.Snapshot()
-	if len(snap) != 3 {
-		t.Fatalf("expected 3 ports (shared IP collapses), got %d: %+v", len(snap), snap)
+	if len(snap) != 4 {
+		t.Fatalf("expected all 4 parsed nodes, got %d: %+v", len(snap), snap)
 	}
 	tags := map[string]bool{}
 	for _, s := range snap {

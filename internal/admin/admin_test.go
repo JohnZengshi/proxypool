@@ -50,6 +50,36 @@ func TestHandlerProbeRejectsInvalidPort(t *testing.T) {
 	}
 }
 
+func TestHandlerReconnectRejectsInvalidPort(t *testing.T) {
+	// Given: a manager with no nodes.
+	m := manager.New(&config.Config{BasePort: 18081}, nil)
+	handler := New(m)
+
+	// When: reconnecting a non-numeric port.
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/reconnect?port=abc", nil))
+
+	// Then: the API rejects invalid input.
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf("reconnect = %d, want %d", response.Code, http.StatusBadRequest)
+	}
+}
+
+func TestHandlerReconnectPortNotFound(t *testing.T) {
+	// Given: a manager with no nodes.
+	m := manager.New(&config.Config{BasePort: 18081}, nil)
+	handler := New(m)
+
+	// When: reconnecting an unknown port.
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodPost, "/reconnect?port=28099", nil))
+
+	// Then: the API returns not found.
+	if response.Code != http.StatusNotFound {
+		t.Fatalf("reconnect = %d, want %d", response.Code, http.StatusNotFound)
+	}
+}
+
 func TestHandlerDashboard(t *testing.T) {
 	m := manager.New(&config.Config{BasePort: 18081}, nil)
 	handler := New(m)
@@ -63,7 +93,7 @@ func TestHandlerDashboard(t *testing.T) {
 	if ct := response.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
 		t.Fatalf("content type = %q, want text/html", ct)
 	}
-	for _, want := range []string{`fetch("/status")`, `fetch("/history")`, `"/probe"`, "probe-all", "slow_latency_ms", "last_error"} {
+	for _, want := range []string{`fetch("/status")`, `fetch("/history")`, `"/probe"`, `"/reconnect"`, "probe-all", "reconnect-all", "data-reconnect", "slow_latency_ms", "last_error"} {
 		if !strings.Contains(response.Body.String(), want) {
 			t.Fatalf("dashboard missing %q", want)
 		}

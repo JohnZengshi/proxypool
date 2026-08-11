@@ -32,6 +32,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.health(w)
 	case r.Method == http.MethodPost && r.URL.Path == "/probe":
 		h.probe(w, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/reconnect":
+		h.reconnect(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -81,9 +83,10 @@ svg{display:block}
 <body>
 <header>
   <h1>Proxy Pool</h1>
-  <div class="header-actions">
+ <div class="header-actions">
     <span class="pill" id="updated">等待数据</span>
     <button class="primary" id="probe-all">探测全部</button>
+    <button class="primary" id="reconnect-all">全部重连</button>
   </div>
 </header>
 <main>
@@ -131,7 +134,7 @@ function render(){
   el("empty").style.display=filtered.length?"none":"block";
   el("rows").innerHTML=filtered.map(n=>{
     const cls=statusFor(n);
-    return '<tr data-port="'+n.port+'"><td>'+n.port+'</td><td class="proxy">http://127.0.0.1:'+n.port+'</td><td>'+esc(n.exit_ip||"-")+'</td><td><span class="status '+cls+'"><span class="dot"></span>'+statuses[cls]+'</span></td><td class="latency '+latencyClass(n.latency_ms)+'">'+latencyText(n.latency_ms)+'</td><td class="err" title="'+esc(n.last_error||"")+'">'+esc(n.last_error||"-")+'</td><td>'+esc(n.tag||"-")+'</td><td>'+esc(n.node_name||"-")+'</td><td>'+spark(n.port)+'</td><td><button data-probe="'+n.port+'">探测</button></td></tr>';
+    return '<tr data-port="'+n.port+'"><td>'+n.port+'</td><td class="proxy">http://127.0.0.1:'+n.port+'</td><td>'+esc(n.exit_ip||"-")+'</td><td><span class="status '+cls+'"><span class="dot"></span>'+statuses[cls]+'</span></td><td class="latency '+latencyClass(n.latency_ms)+'">'+latencyText(n.latency_ms)+'</td><td class="err" title="'+esc(n.last_error||"")+'">'+esc(n.last_error||"-")+'</td><td>'+esc(n.tag||"-")+'</td><td>'+esc(n.node_name||"-")+'</td><td>'+spark(n.port)+'</td><td><button data-probe="'+n.port+'">探测</button><button data-reconnect="'+n.port+'">重连</button></td></tr>';
   }).join("");
   el("updated").textContent="更新 "+new Date().toLocaleTimeString();
 }
@@ -153,9 +156,22 @@ async function doProbe(port){
   }catch(err){el("error").textContent="探测失败："+err;el("error").style.display="block";}
   if(btn)btn.disabled=false;
 }
+async function doReconnect(port){
+  const selector=port==null?"#reconnect-all":'[data-reconnect="'+port+'"]';
+  const btn=document.querySelector(selector);
+  if(btn)btn.disabled=true;
+  try{
+    const r=await fetch(port==null?"/reconnect":"/reconnect?port="+port,{method:"POST"});
+    if(!r.ok)throw new Error(await r.text());
+    await load();
+  }catch(err){el("error").textContent="重连失败："+err;el("error").style.display="block";}
+  if(btn)btn.disabled=false;
+}
 el("probe-all").addEventListener("click",()=>doProbe(null));
+el("reconnect-all").addEventListener("click",()=>doReconnect(null));
 el("tag-filter").addEventListener("change",e=>{state.tag=e.target.value;render();});
 document.addEventListener("click",e=>{const b=e.target.closest("[data-probe]");if(b)doProbe(Number(b.dataset.probe));});
+document.addEventListener("click",e=>{const b=e.target.closest("[data-reconnect]");if(b)doReconnect(Number(b.dataset.reconnect));});
 load();setInterval(load,5000);
 </script>
 </body>
@@ -172,14 +188,10 @@ func (h *Handler) health(w http.ResponseWriter) {
 }
 
 func (h *Handler) probe(w http.ResponseWriter, r *http.Request) {
-	port := 0
-	if value := r.URL.Query().Get("port"); value != "" {
-		var err error
-		port, err = strconv.Atoi(value)
-		if err != nil || port < 1 || port > 65535 {
-			http.Error(w, "invalid port", http.StatusBadRequest)
-			return
-		}
+	port, err := parsePort(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	if err := h.manager.ProbeNow(r.Context(), port); err != nil {
 		if errors.Is(err, manager.ErrPortNotFound) {
@@ -190,6 +202,35 @@ func (h *Handler) probe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *Handler) reconnect(w http.ResponseWriter, r *http.Request) {
+	port, err := parsePort(r)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err := h.manager.ReconnectNow(r.Context(), port); err != nil {
+		if errors.Is(err, manager.ErrPortNotFound) {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		http.Error(w, "reconnect failed", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func parsePort(r *http.Request) (int, error) {
+	value := r.URL.Query().Get("port")
+	if value == "" {
+		return 0, nil
+	}
+	port, err := strconv.Atoi(value)
+	if err != nil || port < 1 || port > 65535 {
+		return 0, fmt.Errorf("invalid port")
+	}
+	return port, nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
