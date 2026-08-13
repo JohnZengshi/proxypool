@@ -1,6 +1,6 @@
 # proxypool
 
-Go proxy pool service that loads Clash, sing-box, or Windows VPNCheap cache sources, probes each node's real exit IP, dedupes by exit IP, and exposes one no-auth HTTP+SOCKS5 port per surviving node.
+Go proxy pool service that loads Clash, sing-box, or Windows/macOS VPNCheap cache sources, probes each node's real exit IP, dedupes by exit IP, and exposes one no-auth HTTP+SOCKS5 port per surviving node.
 
 ## What it does
 
@@ -79,7 +79,7 @@ curl -X POST http://127.0.0.1:18080/probe?port=18081
 |---|---|---|
 | `sources` | `[]` | List of `{tag,type,url[,path]}` sources; type is `clash`, `singbox`, or `vpncheap` |
 | `subscription_url` | _(optional)_ | Legacy single Clash URL; promoted to one `default` source when `sources` is empty |
-| `path` | _(vpncheap only)_ | Windows cache file; defaults to `%APPDATA%\vpncheap\app_state.json` |
+| `path` | _(vpncheap only)_ | Local cache override; Windows defaults to `%APPDATA%\vpncheap\app_state.json`, macOS defaults to the installed app's CFNetwork `Cache.db` |
 | `bind` | `127.0.0.1` | Bind address for proxy ports |
 | `base_port` | `18081` | First port for proxy nodes |
 | `status_port` | `18080` | Port for the monitoring dashboard and status API |
@@ -97,7 +97,7 @@ CLI flags can override config: `-sub`, `-bind`, `-base-port`.
 
 ## VPNCheap source
 
-On Windows, `type: vpncheap` reads and decrypts the current user's VPNCheap local cache, so VPNCheap does not need to be running. Set `path` to override the default cache file. On macOS, `url` is required and is fetched as a sing-box subscription, preserving the previous behavior. Linux accepts the config but reports `vpncheap` as unsupported at source load.
+On Windows, `type: vpncheap` reads and decrypts the current user's VPNCheap local cache, so VPNCheap does not need to be running. Set `path` to override the default cache file. On macOS, `type: vpncheap` reads the newest valid sing-box response from the installed app's CFNetwork `Cache.db`, so no subscription URL is needed. Set `path` to override cache discovery. macOS defaults to `~/Library/Containers/com.vpncheap.macnative/Data/Library/Caches/com.vpncheap.macnative/Cache.db`, falling back to the legacy `com.novamindllc.vpncheap` container when the current cache is missing. Linux accepts the config but reports `vpncheap` as unsupported at source load.
 
 ## Monitoring dashboard
 

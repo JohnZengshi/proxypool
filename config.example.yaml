@@ -15,7 +15,7 @@ log_format: text
 
 # Tagged subscription sources. Each node is labeled with its source tag.
 # type is "clash" (clash-vmess), "singbox" (sing-box JSON config), or
-# "vpncheap" (Windows local cache; macOS URL fallback).
+# "vpncheap" (Windows or macOS local cache).
 # The legacy single "subscription_url" field still works: when "sources" is
 # empty it is promoted to one source tagged "default" of type "clash".
 sources:
@@ -28,5 +28,7 @@ sources:
     # need to be running. Override the default %APPDATA%\vpncheap\app_state.json
     # with "path".
     # path: "C:\\Users\\me\\AppData\\Roaming\\vpncheap\\app_state.json"
-    # macOS requires and fetches this URL as a sing-box subscription.
-    url: "https://example.com/cheap/your-token?flag=sing-box"
+    # macOS reads the current user's CFNetwork cache and also does not need a
+    # subscription URL. It uses the current app bundle first, then the legacy
+    # bundle, or an explicit "path":
+    # path: "/Users/me/Library/Containers/com.vpncheap.macnative/Data/Library/Caches/com.vpncheap.macnative/Cache.db"

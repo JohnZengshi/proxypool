@@ -312,9 +312,79 @@ func TestLoadVPNCheapWindowsDefaultPath(t *testing.T) {
 	}
 }
 
+func TestLoadVPNCheapDarwinDefaultPath(t *testing.T) {
+	tests := []struct {
+		name   string
+		create string
+		want   string
+	}{
+		{
+			name:   "current_cache_wins",
+			create: "current",
+			want:   "current",
+		},
+		{
+			name:   "legacy_fallback",
+			create: "legacy",
+			want:   "legacy",
+		},
+		{
+			name:   "missing_cache_defaults_to_current",
+			create: "",
+			want:   "current",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			if runtime.GOOS == "windows" {
+				t.Setenv("USERPROFILE", home)
+			} else {
+				t.Setenv("HOME", home)
+			}
+			current := filepath.Join(home, "Library", "Containers", "com.vpncheap.macnative", "Data", "Library", "Caches", "com.vpncheap.macnative", "Cache.db")
+			legacy := filepath.Join(home, "Library", "Containers", "com.novamindllc.vpncheap", "Data", "Library", "Caches", "com.novamindllc.vpncheap", "Cache.db")
+			var create string
+			switch tt.create {
+			case "current":
+				create = current
+			case "legacy":
+				create = legacy
+			}
+			if tt.create != "" {
+				if err := os.MkdirAll(filepath.Dir(create), 0755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(create, []byte("cache"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			want := current
+			if tt.create == "legacy" {
+				want = legacy
+			}
+
+			cfg := defaults()
+			cfg.Sources = []Source{{Tag: "vpncheap", Type: SourceVPNCheap}}
+			cfg.normalizeOn("darwin")
+			if cfg.Sources[0].Path != want {
+				t.Fatalf("expected Darwin default path %q, got %q", want, cfg.Sources[0].Path)
+			}
+			if cfg.Sources[0].URL != "" {
+				t.Fatalf("expected optional URL to stay empty, got %q", cfg.Sources[0].URL)
+			}
+		})
+	}
+}
+
 func TestSourcesVPNCheapPlatformValidation(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("APPDATA", dir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", dir)
+	} else {
+		t.Setenv("HOME", dir)
+	}
 	tests := []struct {
 		name   string
 		goos   string
@@ -330,23 +400,52 @@ func TestSourcesVPNCheapPlatformValidation(t *testing.T) {
 			},
 		},
 		{
-			name: "macos_url_required",
+			name: "macos_default_path",
 			goos: "darwin",
 			source: Source{
 				Tag:  "vpncheap",
 				Type: SourceVPNCheap,
 			},
-			want: "url must not be empty for vpncheap on darwin",
 		},
 		{
-			name: "macos_bad_url_scheme",
+			name: "macos_explicit_path",
 			goos: "darwin",
 			source: Source{
 				Tag:  "vpncheap",
 				Type: SourceVPNCheap,
-				URL:  "ftp://example.com/sub",
+				Path: filepath.Join(dir, "Cache.db"),
 			},
-			want: "url must be http or https",
+		},
+		{
+			name: "macos_url_set",
+			goos: "darwin",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+				URL:  "https://example.com/cheap/secret-token",
+			},
+			want: "url must not be set for vpncheap on darwin",
+		},
+		{
+			name: "macos_url_with_path",
+			goos: "darwin",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+				URL:  "https://example.com/cheap/secret-token",
+				Path: filepath.Join(dir, "Cache.db"),
+			},
+			want: "url must not be set for vpncheap on darwin",
+		},
+		{
+			name: "macos_path_url",
+			goos: "darwin",
+			source: Source{
+				Tag:  "vpncheap",
+				Type: SourceVPNCheap,
+				Path: "https://example.com/Cache.db",
+			},
+			want: "path must be a filesystem path",
 		},
 		{
 			name: "windows_path_url",
@@ -385,17 +484,37 @@ func TestSourcesVPNCheapPlatformValidation(t *testing.T) {
 			if !strings.Contains(err.Error(), tt.want) {
 				t.Fatalf("error %q should contain %q", err.Error(), tt.want)
 			}
+			if tt.source.URL != "" && strings.Contains(err.Error(), tt.source.URL) {
+				t.Fatalf("error leaked URL %q: %v", tt.source.URL, err)
+			}
 		})
 	}
 }
 
 func TestLoadConfigExamplePortable(t *testing.T) {
+	home := t.TempDir()
+	appData := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", home)
+	} else {
+		t.Setenv("HOME", home)
+	}
+	t.Setenv("APPDATA", appData)
 	cfg, err := Load(filepath.Join("..", "..", "config.example.yaml"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, goos := range []string{"windows", "darwin", "linux"} {
-		if err := cfg.validateOn(goos); err != nil {
+		portable := *cfg
+		portable.Sources = append([]Source(nil), cfg.Sources...)
+		for i := range portable.Sources {
+			if portable.Sources[i].Type == SourceVPNCheap {
+				portable.Sources[i].URL = ""
+				portable.Sources[i].Path = ""
+			}
+		}
+		portable.normalizeOn(goos)
+		if err := portable.validateOn(goos); err != nil {
 			t.Fatalf("config example failed validation on %s: %v", goos, err)
 		}
 	}

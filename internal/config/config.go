@@ -212,7 +212,26 @@ func (c *Config) normalizeOn(goos string) {
 				c.Sources[i].Path = filepath.Join(appData, "vpncheap", "app_state.json")
 			}
 		}
+		if c.Sources[i].Type == SourceVPNCheap && goos == "darwin" && c.Sources[i].Path == "" {
+			c.Sources[i].Path = vpncheapDarwinDefaultPath()
+		}
 	}
+}
+
+func vpncheapDarwinDefaultPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	current := filepath.Join(home, "Library", "Containers", "com.vpncheap.macnative", "Data", "Library", "Caches", "com.vpncheap.macnative", "Cache.db")
+	if _, err := os.Stat(current); err == nil {
+		return current
+	}
+	legacy := filepath.Join(home, "Library", "Containers", "com.novamindllc.vpncheap", "Data", "Library", "Caches", "com.novamindllc.vpncheap", "Cache.db")
+	if _, err := os.Stat(legacy); err == nil {
+		return legacy
+	}
+	return current
 }
 
 // Validate checks required fields and constraints.
@@ -245,11 +264,14 @@ func (c *Config) validateOn(goos string) error {
 				return fmt.Errorf("sources[%d] (tag %q): path must be a filesystem path, not a URL", i, s.Tag)
 			}
 		case s.Type == SourceVPNCheap && goos == "darwin":
-			if s.URL == "" {
-				return fmt.Errorf("sources[%d] (tag %q): url must not be empty for vpncheap on darwin", i, s.Tag)
+			if s.URL != "" {
+				return fmt.Errorf("sources[%d] (tag %q): url must not be set for vpncheap on darwin", i, s.Tag)
 			}
-			if !hasScheme(s.URL, "http", "https") {
-				return fmt.Errorf("sources[%d] (tag %q): url must be http or https", i, s.Tag)
+			if s.Path == "" {
+				return fmt.Errorf("sources[%d] (tag %q): path must not be empty for vpncheap on darwin", i, s.Tag)
+			}
+			if hasScheme(s.Path, "http", "https") {
+				return fmt.Errorf("sources[%d] (tag %q): path must be a filesystem path, not a URL", i, s.Tag)
 			}
 		case s.Type != SourceVPNCheap:
 			if s.URL == "" {
